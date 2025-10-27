@@ -1,4 +1,4 @@
-# Arquivo: atualizar_contratacoes.py (Versão com Verificação de Status Interno)
+# Arquivo: atualizar_contratacoes.py (Versão com Verificação Inteligente)
 
 import os
 import aiohttp
@@ -42,15 +42,24 @@ def get_db_connection():
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
-def verificar_se_compra_esta_ativa_no_db(conn, id_compra):
+# <<< LÓGICA DE VERIFICAÇÃO CORRIGIDA >>>
+def verificar_se_deve_buscar_api(conn, id_compra):
     """
-    Verifica no DB se algum item da compra tem o status 'em andamento'.
-    Retorna True se encontrar, False caso contrário.
+    Verifica se uma busca na API é necessária.
+    - Se a compra for nova, busca.
+    - Se a compra já existe, só busca se tiver itens 'em andamento'.
     """
-    # Se a tabela de itens ainda não existir ou estiver vazia, não podemos otimizar.
-    # Portanto, consideramos a compra como "ativa" para forçar a busca na API.
     try:
         with conn.cursor() as cur:
+            # 1. Verifica se a compra já existe no nosso banco
+            cur.execute("SELECT EXISTS (SELECT 1 FROM compras WHERE id = %s);", (id_compra,))
+            compra_existe = cur.fetchone()[0]
+
+            if not compra_existe:
+                logging.info(f"Compra {id_compra} é nova. Busca na API necessária.")
+                return True
+
+            # 2. Se a compra existe, aplica a otimização
             query = """
                 SELECT EXISTS (
                     SELECT 1 
@@ -59,17 +68,18 @@ def verificar_se_compra_esta_ativa_no_db(conn, id_compra):
                 );
             """
             cur.execute(query, (id_compra,))
-            result = cur.fetchone()
+            tem_itens_em_andamento = cur.fetchone()[0]
             
-            if result and result[0]:
-                logging.info(f"Compra {id_compra} tem itens 'em andamento' no DB. Verificação de API necessária.")
+            if tem_itens_em_andamento:
+                logging.info(f"Compra {id_compra} existe e tem itens 'em andamento'. Busca na API necessária.")
                 return True
-            
-            logging.info(f"Compra {id_compra} não tem itens 'em andamento' no DB. Pulando chamadas de API para esta execução.")
-            return False
-    except psycopg2.errors.UndefinedTable:
-        logging.warning("Tabela 'itens_compra' não existe. Considera-se a compra como ativa.")
-        return True # Força a busca na API se a tabela ainda não foi criada
+            else:
+                logging.info(f"Compra {id_compra} existe, mas não tem itens 'em andamento'. Pulando API.")
+                return False
+                
+    except psycopg2.Error as e:
+        logging.error(f"Erro de banco de dados ao verificar status da compra {id_compra}: {e}. Forçando busca na API por segurança.")
+        return True # Em caso de erro, é mais seguro buscar na API.
 
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     """Função genérica para inserir ou atualizar dados (UPSERT)."""
@@ -141,13 +151,10 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
     async with semaphore:
         logging.info(f"Processando idCompra: {id_compra}")
 
-        # Etapa de Otimização: Verifica o status no nosso banco de dados primeiro.
-        if not verificar_se_compra_esta_ativa_no_db(conn, id_compra):
-            # Se não estiver ativa, não precisamos chamar a API.
-            # Retornamos False para garantir que ela não seja arquivada por engano.
+        # <<< LÓGICA DE VERIFICAÇÃO CORRIGIDA >>>
+        if not verificar_se_deve_buscar_api(conn, id_compra):
             return False
 
-        # Se a verificação passou, continuamos com o fluxo normal de chamadas de API.
         params = {'tipo': 'idCompra', 'codigo': id_compra}
         contratacao_json = await fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
         
@@ -165,7 +172,6 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
         persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []))
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
 
-        # Lógica de arquivamento baseada nos dados frescos da API.
         situacao = compra.get('situacaoCompraNomePncp', '').lower()
         excluida = compra.get('contratacaoExcluida', False)
 
