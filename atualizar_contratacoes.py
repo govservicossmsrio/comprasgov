@@ -5,7 +5,7 @@ import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
 import logging
-from datetime import datetime
+from datetime import datetime, timezone # <<< MUDANÇA 1: timezone importado
 
 # --- Configuração Inicial ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,12 +30,19 @@ def get_db_connection():
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
+# <<< MUDANÇA 2: Função get_compra_update_date corrigida >>>
 def get_compra_update_date(conn, id_compra):
-    """Busca a data de atualização de uma compra no banco."""
+    """
+    Busca a data de atualização de uma compra no banco e a retorna como um 
+    objeto datetime ciente do fuso horário (offset-aware) em UTC.
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT data_atualizacao_pncp FROM compras WHERE id = %s", (id_compra,))
         result = cur.fetchone()
-        return result[0] if result else None
+        if result and result[0]:
+            # Pega a data naive do banco e anexa a informação de que ela está em UTC.
+            return result[0].replace(tzinfo=timezone.utc)
+        return None
 
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     """Função genérica para inserir ou atualizar dados (UPSERT)."""
@@ -136,11 +143,10 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
 
     # 4. Fornecedores e Resultados
     if resultados_data:
-        # <<< A CORREÇÃO ESTÁ AQUI >>>
         fornecedores_para_db = list(set([(
             res.get('niFornecedor'), 
             res.get('nomeRazaoSocialFornecedor'), 
-            res.get('tipoPessoa', ''),  # Garante que um valor nulo não quebre a inserção
+            res.get('tipoPessoa', ''),
             res.get('porteFornecedorId'), 
             res.get('porteFornecedorNome')
         ) for res in resultados_data if res.get('niFornecedor')]))
@@ -214,8 +220,9 @@ async def main_async():
         except FileNotFoundError:
             logging.error("Arquivo 'idCompra_lista.txt' não encontrado.")
         finally:
-            conn.close()
-            logging.info("Conexão com o banco de dados fechada.")
+            if conn:
+                conn.close()
+                logging.info("Conexão com o banco de dados fechada.")
 
 if __name__ == "__main__":
     asyncio.run(main_async())
