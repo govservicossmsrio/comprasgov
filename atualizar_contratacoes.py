@@ -1,5 +1,3 @@
-# Arquivo: atualizar_contratacoes.py (Versão Final com Persistência)
-
 import os
 import aiohttp
 import asyncio
@@ -138,7 +136,14 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
 
     # 4. Fornecedores e Resultados
     if resultados_data:
-        fornecedores_para_db = list(set([(res.get('niFornecedor'), res.get('nomeRazaoSocialFornecedor'), res.get('tipoPessoa'), res.get('porteFornecedorId'), res.get('porteFornecedorNome')) for res in resultados_data if res.get('niFornecedor')]))
+        # <<< A CORREÇÃO ESTÁ AQUI >>>
+        fornecedores_para_db = list(set([(
+            res.get('niFornecedor'), 
+            res.get('nomeRazaoSocialFornecedor'), 
+            res.get('tipoPessoa', ''),  # Garante que um valor nulo não quebre a inserção
+            res.get('porteFornecedorId'), 
+            res.get('porteFornecedorNome')
+        ) for res in resultados_data if res.get('niFornecedor')]))
         upsert_data(conn, 'fornecedores', ['ni', 'nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'], fornecedores_para_db, ['ni'], ['nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'])
 
         resultados_para_db = [(
@@ -182,8 +187,6 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
         
         itens_json, resultados_json = await asyncio.gather(itens_task, resultados_task)
         
-        # <<< A MUDANÇA ESTÁ AQUI >>>
-        # Chamando a função para salvar os dados no banco
         persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []))
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
 
