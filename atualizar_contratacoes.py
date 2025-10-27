@@ -1,5 +1,3 @@
-# Arquivo: atualizar_contratacoes.py (Correção Final - Data da API)
-
 import os
 import aiohttp
 import asyncio
@@ -25,6 +23,9 @@ def get_db_connection():
     try:
         conn = psycopg2.connect(CONN_STRING)
         logging.info("Conexão com o banco de dados estabelecida com sucesso.")
+        with conn.cursor() as cur:
+            cur.execute("SET TIME ZONE 'America/Sao_Paulo';")
+        logging.info("Fuso horário da sessão configurado para 'America/Sao_Paulo'.")
         return conn
     except psycopg2.OperationalError as e:
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
@@ -35,7 +36,7 @@ def get_compra_update_date(conn, id_compra):
         cur.execute("SELECT data_atualizacao_pncp FROM compras WHERE id = %s", (id_compra,))
         result = cur.fetchone()
         if result and result[0] is not None:
-            return result[0].replace(tzinfo=timezone.utc)
+            return result[0]
     return None
 
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
@@ -67,33 +68,17 @@ async def fetch_api_data_async(session, endpoint, params):
         return None
 
 # --- Funções de Processamento e Persistência ---
-
-# <<< MUDANÇA 1: A função agora aceita 'api_update_date_obj' >>>
 def persistir_dados(conn, compra_data, itens_data, resultados_data, api_update_date_obj):
-    """Pega os dados brutos da API e os insere/atualiza no banco de dados."""
-    
-    # ... (as inserções em orgaos e unidades_uasg permanecem iguais) ...
+    # (Esta função permanece a mesma da versão anterior)
     orgao_para_db = [(compra_data.get('codigoOrgao'), compra_data.get('orgaoEntidadeRazaoSocial'), compra_data.get('orgaoEntidadeEsferaId'), compra_data.get('orgaoEntidadePoderId'), compra_data.get('orgaoEntidadeCnpj'), compra_data.get('orgaoEntidadeRazaoSocial'))]
     upsert_data(conn, 'orgaos', ['codigo', 'nome', 'esfera', 'poder', 'cnpj', 'razao_social'], orgao_para_db, ['codigo'], ['nome', 'esfera', 'poder', 'cnpj', 'razao_social'])
     unidade_para_db = [(compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('unidadeOrgaoNomeUnidade'), compra_data.get('unidadeOrgaoMunicipioNome'), compra_data.get('unidadeOrgaoCodigoIbge'), compra_data.get('unidadeOrgaoUfSigla'), compra_data.get('codigoOrgao'), api_update_date_obj)]
     upsert_data(conn, 'unidades_uasg', ['codigo', 'nome', 'municipio_nome', 'municipio_codigo_ibge', 'uf_sigla', 'codigo_orgao', 'data_atualizacao'], unidade_para_db, ['codigo'], ['nome', 'municipio_nome', 'municipio_codigo_ibge', 'uf_sigla', 'codigo_orgao', 'data_atualizacao'])
-
-    # 2. Compra
     id_compra = compra_data.get('idCompra')
     id_contratacao = id_compra[-9:] if id_compra else None
-    compra_para_db = [(
-        id_compra, id_contratacao, compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('codigoModalidade'),
-        compra_data.get('numeroControlePNCP'), compra_data.get('processo'), compra_data.get('objetoCompra'), compra_data.get('srp'),
-        compra_data.get('situacaoCompraNomePncp'), compra_data.get('valorTotalEstimado'), compra_data.get('valorTotalHomologado'),
-        compra_data.get('dataInclusaoPncp'), 
-        api_update_date_obj,  # <<< MUDANÇA 2: Usando o objeto datetime 'aware' aqui
-        compra_data.get('dataPublicacaoPncp'),
-        compra_data.get('dataAberturaPropostaPncp'), compra_data.get('dataEncerramentoPropostaPncp'), compra_data.get('contratacaoExcluida', False)
-    )]
+    compra_para_db = [(id_compra, id_contratacao, compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('codigoModalidade'), compra_data.get('numeroControlePNCP'), compra_data.get('processo'), compra_data.get('objetoCompra'), compra_data.get('srp'), compra_data.get('situacaoCompraNomePncp'), compra_data.get('valorTotalEstimado'), compra_data.get('valorTotalHomologado'), compra_data.get('dataInclusaoPncp'), api_update_date_obj, compra_data.get('dataPublicacaoPncp'), compra_data.get('dataAberturaPropostaPncp'), compra_data.get('dataEncerramentoPropostaPncp'), compra_data.get('contratacaoExcluida', False))]
     compra_cols = ['id', 'id_contratacao', 'unidade_uasg_codigo', 'modalidade_codigo', 'numero_controle_pncp', 'processo', 'objeto_compra', 'srp', 'situacao_compra_pncp', 'valor_total_estimado', 'valor_total_homologado', 'data_inclusao_pncp', 'data_atualizacao_pncp', 'data_publicacao_pncp', 'data_abertura_proposta', 'data_encerramento_proposta', 'contratacao_excluida']
     upsert_data(conn, 'compras', compra_cols, compra_para_db, ['id'], [col for col in compra_cols if col != 'id'])
-
-    # ... (o resto da função permanece igual) ...
     if itens_data:
         catalogo_para_db = list(set([(item.get('codItemCatalogo'), item.get('descricaoResumida'), item.get('materialOuServicoNome')) for item in itens_data if item.get('codItemCatalogo')]))
         upsert_data(conn, 'itens_catalogo', ['codigo', 'descricao', 'tipo'], catalogo_para_db, ['codigo'], ['descricao', 'tipo'])
@@ -111,7 +96,8 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
     async with semaphore:
         logging.info(f"Processando idCompra: {id_compra}")
         
-        db_update_date = get_compra_update_date(conn, id_compra)
+        # 1. Obter datas
+        db_update_date_raw = get_compra_update_date(conn, id_compra)
         
         params = {'tipo': 'idCompra', 'codigo': id_compra}
         contratacao_json = await fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
@@ -122,28 +108,48 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
 
         compra = contratacao_json['resultado'][0]
         api_update_date_str = compra.get('dataAtualizacaoPncp')
-        api_update_date = None
         
-        try:
-            if api_update_date_str:
-                # Esta conversão cria um objeto 'aware'
-                api_update_date = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
-        except (ValueError, TypeError) as e:
-            logging.error(f"Não foi possível converter a data da API '{api_update_date_str}': {e}")
+        # 2. Lógica de comparação robusta
+        # Se não tivermos uma das datas, consideramos que a atualização é necessária
+        deve_atualizar = True
+        if db_update_date_raw and api_update_date_str:
+            try:
+                # <<< LÓGICA DE CORREÇÃO APLICADA AQUI >>>
+                # Garante que ambas as datas sejam "aware" e em UTC antes de comparar.
+                
+                # Para a data da API:
+                api_date_aware = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
+                
+                # Para a data do DB:
+                # Se ela já for "aware", ótimo. Se for "naive", assume que é UTC.
+                db_date_aware = db_update_date_raw if db_update_date_raw.tzinfo else db_update_date_raw.replace(tzinfo=timezone.utc)
 
-        if db_update_date and api_update_date and db_update_date >= api_update_date:
-            logging.info(f"Dados para idCompra {id_compra} já estão atualizados. Pulando.")
+                # Agora a comparação é segura
+                if db_date_aware >= api_date_aware:
+                    logging.info(f"Dados para idCompra {id_compra} já estão atualizados. Pulando.")
+                    deve_atualizar = False
+            
+            except (ValueError, TypeError) as e:
+                logging.error(f"Erro ao comparar datas para idCompra {id_compra}. Prosseguindo com a atualização por segurança. Erro: {e}")
+                deve_atualizar = True
+        
+        if not deve_atualizar:
             return
 
+        # 3. Prosseguir com a atualização
         logging.info(f"Atualização necessária para idCompra {id_compra}. Buscando sub-dados...")
+
+        # Recria o objeto datetime da API para passar para a função de persistência
+        api_update_date_obj = None
+        if api_update_date_str:
+            api_update_date_obj = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
 
         itens_task = fetch_api_data_async(session, "2.1_consultarItensContratacoes_PNCP_14133_Id", params)
         resultados_task = fetch_api_data_async(session, "3.1_consultarResultadoItensContratacoes_PNCP_14133_Id", params)
         
         itens_json, resultados_json = await asyncio.gather(itens_task, resultados_task)
         
-        # <<< MUDANÇA 3: Passando o objeto 'api_update_date' para a função de persistência >>>
-        persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []), api_update_date)
+        persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []), api_update_date_obj)
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
 
 # --- Função Principal Assíncrona ---
