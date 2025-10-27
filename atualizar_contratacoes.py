@@ -1,5 +1,6 @@
+# Arquivo: atualizar_contratacoes.py (Versão Corrigida)
+
 import os
-import requests # Manteremos para o código síncrono, se houver
 import aiohttp
 import asyncio
 import psycopg2
@@ -14,13 +15,60 @@ load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 API_BASE_URL = "https://dadosabertos.compras.gov.br/modulo-contratacoes"
-# Limite de requisições concorrentes. Comece com um valor baixo (5-10) e aumente com cuidado.
-CONCURRENT_REQUESTS_LIMIT = 10 
+CONCURRENT_REQUESTS_LIMIT = 10
 
-# --- Funções de Banco de Dados (permanecem as mesmas) ---
-# get_db_connection, get_compra_update_date, upsert_data...
+# ==============================================================================
+# SEÇÃO CORRIGIDA: FUNÇÕES DE BANCO DE DADOS ADICIONADAS AQUI
+# ==============================================================================
 
-# --- Novas Funções de API Assíncronas ---
+def get_db_connection():
+    """Cria e retorna uma conexão com o banco de dados."""
+    if not CONN_STRING:
+        logging.error("String de conexão COCKROACHDB_CONN_STRING não encontrada.")
+        return None
+    try:
+        conn = psycopg2.connect(CONN_STRING)
+        logging.info("Conexão com o banco de dados estabelecida com sucesso.")
+        return conn
+    except psycopg2.OperationalError as e:
+        logging.error(f"Erro ao conectar ao banco de dados: {e}")
+        return None
+
+def get_compra_update_date(conn, id_compra):
+    """Busca a data de atualização de uma compra no banco."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT data_atualizacao_pncp FROM compras WHERE id = %s", (id_compra,))
+        result = cur.fetchone()
+        return result[0] if result else None
+
+def upsert_data(conn, table, columns, data, conflict_target, update_columns):
+    """
+    Função genérica para inserir ou atualizar dados (UPSERT).
+    """
+    if not data:
+        return 0
+        
+    cols_str = ", ".join(columns)
+    update_str = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
+    conflict_str = ", ".join(conflict_target)
+    
+    query = f"""
+        INSERT INTO {table} ({cols_str})
+        VALUES %s
+        ON CONFLICT ({conflict_str}) DO UPDATE SET {update_str};
+    """
+    
+    with conn.cursor() as cur:
+        extras.execute_values(cur, query, data)
+        conn.commit()
+        return cur.rowcount
+
+# ==============================================================================
+# FIM DA SEÇÃO CORRIGIDA
+# ==============================================================================
+
+
+# --- Funções de API Assíncronas ---
 
 async def fetch_api_data_async(session, endpoint, params):
     """Busca dados de um endpoint da API de forma assíncrona."""
@@ -28,7 +76,7 @@ async def fetch_api_data_async(session, endpoint, params):
     try:
         async with session.get(url, params=params) as response:
             response.raise_for_status()
-            return await response.json(content_type=None) # content_type=None lida com headers incorretos
+            return await response.json(content_type=None)
     except aiohttp.ClientError as e:
         logging.error(f"Erro de cliente ao chamar a API {endpoint} com params {params}: {e}")
         return None
@@ -37,19 +85,17 @@ async def fetch_api_data_async(session, endpoint, params):
         return None
 
 
-# --- Novas Funções de Processamento Assíncronas ---
+# --- Funções de Processamento Assíncronas ---
 
 async def processar_contratacao_async(session, semaphore, conn, id_compra):
     """
     Processa uma única contratação de forma assíncrona e controlada pelo semáforo.
     """
-    async with semaphore: # Espera por um "espaço" livre no semáforo
+    async with semaphore:
         logging.info(f"Processando idCompra: {id_compra}")
         
-        # 1. Verificar data no banco (operação síncrona, mas rápida)
         db_update_date = get_compra_update_date(conn, id_compra)
         
-        # 2. Buscar dados da contratação principal
         params = {'tipo': 'idCompra', 'codigo': id_compra}
         contratacao_json = await fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
         
@@ -65,46 +111,31 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
         except (ValueError, TypeError):
             api_update_date = None
 
-        # 3. Verificar se a atualização é necessária
         if db_update_date and api_update_date and db_update_date >= api_update_date:
             logging.info(f"Dados para idCompra {id_compra} já estão atualizados. Pulando.")
             return
 
         logging.info(f"Atualização necessária para idCompra {id_compra}. Buscando sub-dados...")
 
-        # 4. Buscar itens e resultados de forma concorrente
         itens_task = fetch_api_data_async(session, "2.1_consultarItensContratacoes_PNCP_14133_Id", params)
         resultados_task = fetch_api_data_async(session, "3.1_consultarResultadoItensContratacoes_PNCP_14133_Id", params)
         
-        # Espera os dois terminarem
         itens_json, resultados_json = await asyncio.gather(itens_task, resultados_task)
         
-        # 5. Persistir os dados no banco (operação síncrona)
-        # A lógica de UPSERT permanece a mesma, mas agora você a chama com os dados coletados
-        # Exemplo simplificado:
-        # upsert_orgao(conn, compra)
-        # upsert_unidade(conn, compra)
-        # upsert_compra(conn, compra)
-        # if itens_json and itens_json.get('resultado'):
-        #     upsert_itens(conn, itens_json['resultado'])
-        # if resultados_json and resultados_json.get('resultado'):
-        #     upsert_resultados(conn, resultados_json['resultado'])
-            
-        logging.info(f"Dados para idCompra {id_compra} foram coletados e enviados para persistência.")
+        # Aqui virá a lógica de persistência, que também usará a função upsert_data
+        logging.info(f"Dados para idCompra {id_compra} foram coletados. (Lógica de persistência a ser implementada).")
 
 
-# --- Nova Função Principal Assíncrona ---
+# --- Função Principal Assíncrona ---
 
 async def main_async():
     """Função principal que orquestra o processo de forma assíncrona."""
-    conn = get_db_connection()
+    conn = get_db_connection() # Esta linha agora funcionará
     if not conn:
         return
 
-    # Cria o semáforo com o limite definido
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
     
-    # Cria uma única sessão aiohttp para reutilizar conexões (mais eficiente)
     async with aiohttp.ClientSession() as session:
         try:
             with open('idCompra_lista.txt', 'r') as f:
@@ -112,10 +143,8 @@ async def main_async():
             
             logging.info(f"Encontrados {len(id_compras)} IDs de compra para processar.")
             
-            # Cria uma lista de tarefas, uma para cada id_compra
             tasks = [processar_contratacao_async(session, semaphore, conn, id_compra) for id_compra in id_compras]
             
-            # Executa todas as tarefas concorrentemente
             await asyncio.gather(*tasks)
                 
         except FileNotFoundError:
@@ -125,5 +154,4 @@ async def main_async():
             logging.info("Conexão com o banco de dados fechada.")
 
 if __name__ == "__main__":
-    # Inicia o loop de eventos do asyncio para rodar a função main_async
     asyncio.run(main_async())
