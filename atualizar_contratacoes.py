@@ -1,3 +1,5 @@
+# Arquivo: atualizar_contratacoes.py (Versão Simplificada e Final)
+
 import os
 import aiohttp
 import asyncio
@@ -23,21 +25,10 @@ def get_db_connection():
     try:
         conn = psycopg2.connect(CONN_STRING)
         logging.info("Conexão com o banco de dados estabelecida com sucesso.")
-        with conn.cursor() as cur:
-            cur.execute("SET TIME ZONE 'America/Sao_Paulo';")
-        logging.info("Fuso horário da sessão configurado para 'America/Sao_Paulo'.")
         return conn
     except psycopg2.OperationalError as e:
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
         return None
-
-def get_compra_update_date(conn, id_compra):
-    with conn.cursor() as cur:
-        cur.execute("SELECT data_atualizacao_pncp FROM compras WHERE id = %s", (id_compra,))
-        result = cur.fetchone()
-        if result and result[0] is not None:
-            return result[0]
-    return None
 
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     if not data: return 0
@@ -49,7 +40,9 @@ def upsert_data(conn, table, columns, data, conflict_target, update_columns):
         try:
             extras.execute_values(cur, query, data)
             conn.commit()
-            logging.info(f"{cur.rowcount} registros inseridos/atualizados na tabela {table}.")
+            # Log um pouco menos verboso para não poluir
+            if cur.rowcount > 0:
+                logging.info(f"{cur.rowcount} registros afetados na tabela {table}.")
             return cur.rowcount
         except Exception as e:
             logging.error(f"Erro ao fazer upsert na tabela {table}: {e}")
@@ -68,8 +61,15 @@ async def fetch_api_data_async(session, endpoint, params):
         return None
 
 # --- Funções de Processamento e Persistência ---
-def persistir_dados(conn, compra_data, itens_data, resultados_data, api_update_date_obj):
-    # (Esta função permanece a mesma da versão anterior)
+def persistir_dados(conn, compra_data, itens_data, resultados_data):
+    api_update_date_obj = None
+    api_update_date_str = compra_data.get('dataAtualizacaoPncp')
+    if api_update_date_str:
+        try:
+            api_update_date_obj = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            logging.warning(f"Não foi possível converter a data da API: {api_update_date_str}")
+
     orgao_para_db = [(compra_data.get('codigoOrgao'), compra_data.get('orgaoEntidadeRazaoSocial'), compra_data.get('orgaoEntidadeEsferaId'), compra_data.get('orgaoEntidadePoderId'), compra_data.get('orgaoEntidadeCnpj'), compra_data.get('orgaoEntidadeRazaoSocial'))]
     upsert_data(conn, 'orgaos', ['codigo', 'nome', 'esfera', 'poder', 'cnpj', 'razao_social'], orgao_para_db, ['codigo'], ['nome', 'esfera', 'poder', 'cnpj', 'razao_social'])
     unidade_para_db = [(compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('unidadeOrgaoNomeUnidade'), compra_data.get('unidadeOrgaoMunicipioNome'), compra_data.get('unidadeOrgaoCodigoIbge'), compra_data.get('unidadeOrgaoUfSigla'), compra_data.get('codigoOrgao'), api_update_date_obj)]
@@ -96,8 +96,8 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
     async with semaphore:
         logging.info(f"Processando idCompra: {id_compra}")
         
-        # 1. Obter datas
-        db_update_date_raw = get_compra_update_date(conn, id_compra)
+        # <<< LÓGICA DE COMPARAÇÃO REMOVIDA >>>
+        # Agora, sempre buscamos os dados e deixamos o banco decidir se atualiza.
         
         params = {'tipo': 'idCompra', 'codigo': id_compra}
         contratacao_json = await fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
@@ -107,49 +107,15 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
             return
 
         compra = contratacao_json['resultado'][0]
-        api_update_date_str = compra.get('dataAtualizacaoPncp')
         
-        # 2. Lógica de comparação robusta
-        # Se não tivermos uma das datas, consideramos que a atualização é necessária
-        deve_atualizar = True
-        if db_update_date_raw and api_update_date_str:
-            try:
-                # <<< LÓGICA DE CORREÇÃO APLICADA AQUI >>>
-                # Garante que ambas as datas sejam "aware" e em UTC antes de comparar.
-                
-                # Para a data da API:
-                api_date_aware = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
-                
-                # Para a data do DB:
-                # Se ela já for "aware", ótimo. Se for "naive", assume que é UTC.
-                db_date_aware = db_update_date_raw if db_update_date_raw.tzinfo else db_update_date_raw.replace(tzinfo=timezone.utc)
-
-                # Agora a comparação é segura
-                if db_date_aware >= api_date_aware:
-                    logging.info(f"Dados para idCompra {id_compra} já estão atualizados. Pulando.")
-                    deve_atualizar = False
-            
-            except (ValueError, TypeError) as e:
-                logging.error(f"Erro ao comparar datas para idCompra {id_compra}. Prosseguindo com a atualização por segurança. Erro: {e}")
-                deve_atualizar = True
-        
-        if not deve_atualizar:
-            return
-
-        # 3. Prosseguir com a atualização
-        logging.info(f"Atualização necessária para idCompra {id_compra}. Buscando sub-dados...")
-
-        # Recria o objeto datetime da API para passar para a função de persistência
-        api_update_date_obj = None
-        if api_update_date_str:
-            api_update_date_obj = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
+        logging.info(f"Buscando sub-dados para idCompra {id_compra}...")
 
         itens_task = fetch_api_data_async(session, "2.1_consultarItensContratacoes_PNCP_14133_Id", params)
         resultados_task = fetch_api_data_async(session, "3.1_consultarResultadoItensContratacoes_PNCP_14133_Id", params)
         
         itens_json, resultados_json = await asyncio.gather(itens_task, resultados_task)
         
-        persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []), api_update_date_obj)
+        persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []))
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
 
 # --- Função Principal Assíncrona ---
