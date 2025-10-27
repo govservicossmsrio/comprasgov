@@ -1,3 +1,5 @@
+# Arquivo: atualizar_contratacoes.py (Versão com Logs de Depuração)
+
 import os
 import aiohttp
 import asyncio
@@ -5,10 +7,11 @@ import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
 import logging
-from datetime import datetime, timezone # <<< MUDANÇA 1: timezone importado
+from datetime import datetime, timezone
 
 # --- Configuração Inicial ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Mudando o formato do log para incluir o nome da função
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
 load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
@@ -30,36 +33,35 @@ def get_db_connection():
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
-# <<< MUDANÇA 2: Função get_compra_update_date corrigida >>>
 def get_compra_update_date(conn, id_compra):
     """
     Busca a data de atualização de uma compra no banco e a retorna como um 
     objeto datetime ciente do fuso horário (offset-aware) em UTC.
     """
+    date_from_db = None
     with conn.cursor() as cur:
         cur.execute("SELECT data_atualizacao_pncp FROM compras WHERE id = %s", (id_compra,))
         result = cur.fetchone()
-        if result and result[0]:
-            # Pega a data naive do banco e anexa a informação de que ela está em UTC.
-            return result[0].replace(tzinfo=timezone.utc)
-        return None
+        if result and result[0] is not None:
+            # Pega a data naive do banco
+            naive_date = result[0]
+            logging.info(f"Data encontrada no DB (naive): {naive_date}, Tipo: {type(naive_date)}")
+            # Anexa a informação de que ela está em UTC para torná-la "aware"
+            date_from_db = naive_date.replace(tzinfo=timezone.utc)
+            logging.info(f"Data convertida para UTC (aware): {date_from_db}, Tipo: {type(date_from_db)}")
+        else:
+            logging.info("Nenhuma data de atualização encontrada no DB para esta compra.")
+    return date_from_db
 
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     """Função genérica para inserir ou atualizar dados (UPSERT)."""
     if not data:
         logging.debug(f"Nenhum dado para fazer upsert na tabela {table}.")
         return 0
-        
     cols_str = ", ".join(columns)
     update_str = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
     conflict_str = ", ".join(conflict_target) if isinstance(conflict_target, list) else conflict_target
-    
-    query = f"""
-        INSERT INTO {table} ({cols_str})
-        VALUES %s
-        ON CONFLICT ({conflict_str}) DO UPDATE SET {update_str};
-    """
-    
+    query = f"INSERT INTO {table} ({cols_str}) VALUES %s ON CONFLICT ({conflict_str}) DO UPDATE SET {update_str};"
     with conn.cursor() as cur:
         try:
             extras.execute_values(cur, query, data)
@@ -72,91 +74,38 @@ def upsert_data(conn, table, columns, data, conflict_target, update_columns):
             return 0
 
 # --- Funções de API Assíncronas ---
-
 async def fetch_api_data_async(session, endpoint, params):
-    """Busca dados de um endpoint da API de forma assíncrona."""
     url = f"{API_BASE_URL}/{endpoint}"
     try:
         async with session.get(url, params=params) as response:
             response.raise_for_status()
             return await response.json(content_type=None)
-    except aiohttp.ClientError as e:
-        logging.error(f"Erro de cliente ao chamar a API {endpoint} com params {params}: {e}")
-        return None
     except Exception as e:
-        logging.error(f"Erro inesperado em fetch_api_data_async para {url}: {e}")
+        logging.error(f"Erro em fetch_api_data_async para {url}: {e}")
         return None
 
 # --- Funções de Processamento e Persistência ---
-
 def persistir_dados(conn, compra_data, itens_data, resultados_data):
-    """Pega os dados brutos da API e os insere/atualiza no banco de dados."""
-    
-    # 1. Orgaos e Unidades (pré-requisitos para 'compras')
-    orgao_para_db = [(
-        compra_data.get('codigoOrgao'),
-        compra_data.get('orgaoEntidadeRazaoSocial'),
-        compra_data.get('orgaoEntidadeEsferaId'),
-        compra_data.get('orgaoEntidadePoderId'),
-        compra_data.get('orgaoEntidadeCnpj'),
-        compra_data.get('orgaoEntidadeRazaoSocial')
-    )]
+    # (Esta função permanece a mesma da versão anterior)
+    orgao_para_db = [(compra_data.get('codigoOrgao'), compra_data.get('orgaoEntidadeRazaoSocial'), compra_data.get('orgaoEntidadeEsferaId'), compra_data.get('orgaoEntidadePoderId'), compra_data.get('orgaoEntidadeCnpj'), compra_data.get('orgaoEntidadeRazaoSocial'))]
     upsert_data(conn, 'orgaos', ['codigo', 'nome', 'esfera', 'poder', 'cnpj', 'razao_social'], orgao_para_db, ['codigo'], ['nome', 'esfera', 'poder', 'cnpj', 'razao_social'])
-
-    unidade_para_db = [(
-        compra_data.get('unidadeOrgaoCodigoUnidade'),
-        compra_data.get('unidadeOrgaoNomeUnidade'),
-        compra_data.get('unidadeOrgaoMunicipioNome'),
-        compra_data.get('unidadeOrgaoCodigoIbge'),
-        compra_data.get('unidadeOrgaoUfSigla'),
-        compra_data.get('codigoOrgao'),
-        compra_data.get('dataAtualizacaoPncp')
-    )]
+    unidade_para_db = [(compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('unidadeOrgaoNomeUnidade'), compra_data.get('unidadeOrgaoMunicipioNome'), compra_data.get('unidadeOrgaoCodigoIbge'), compra_data.get('unidadeOrgaoUfSigla'), compra_data.get('codigoOrgao'), compra_data.get('dataAtualizacaoPncp'))]
     upsert_data(conn, 'unidades_uasg', ['codigo', 'nome', 'municipio_nome', 'municipio_codigo_ibge', 'uf_sigla', 'codigo_orgao', 'data_atualizacao'], unidade_para_db, ['codigo'], ['nome', 'municipio_nome', 'municipio_codigo_ibge', 'uf_sigla', 'codigo_orgao', 'data_atualizacao'])
-
-    # 2. Compra
     id_compra = compra_data.get('idCompra')
     id_contratacao = id_compra[-9:] if id_compra else None
-    compra_para_db = [(
-        id_compra, id_contratacao, compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('codigoModalidade'),
-        compra_data.get('numeroControlePNCP'), compra_data.get('processo'), compra_data.get('objetoCompra'), compra_data.get('srp'),
-        compra_data.get('situacaoCompraNomePncp'), compra_data.get('valorTotalEstimado'), compra_data.get('valorTotalHomologado'),
-        compra_data.get('dataInclusaoPncp'), compra_data.get('dataAtualizacaoPncp'), compra_data.get('dataPublicacaoPncp'),
-        compra_data.get('dataAberturaPropostaPncp'), compra_data.get('dataEncerramentoPropostaPncp'), compra_data.get('contratacaoExcluida', False)
-    )]
+    compra_para_db = [(id_compra, id_contratacao, compra_data.get('unidadeOrgaoCodigoUnidade'), compra_data.get('codigoModalidade'), compra_data.get('numeroControlePNCP'), compra_data.get('processo'), compra_data.get('objetoCompra'), compra_data.get('srp'), compra_data.get('situacaoCompraNomePncp'), compra_data.get('valorTotalEstimado'), compra_data.get('valorTotalHomologado'), compra_data.get('dataInclusaoPncp'), compra_data.get('dataAtualizacaoPncp'), compra_data.get('dataPublicacaoPncp'), compra_data.get('dataAberturaPropostaPncp'), compra_data.get('dataEncerramentoPropostaPncp'), compra_data.get('contratacaoExcluida', False))]
     compra_cols = ['id', 'id_contratacao', 'unidade_uasg_codigo', 'modalidade_codigo', 'numero_controle_pncp', 'processo', 'objeto_compra', 'srp', 'situacao_compra_pncp', 'valor_total_estimado', 'valor_total_homologado', 'data_inclusao_pncp', 'data_atualizacao_pncp', 'data_publicacao_pncp', 'data_abertura_proposta', 'data_encerramento_proposta', 'contratacao_excluida']
     upsert_data(conn, 'compras', compra_cols, compra_para_db, ['id'], [col for col in compra_cols if col != 'id'])
-
-    # 3. Itens e Itens_Catalogo
     if itens_data:
         catalogo_para_db = list(set([(item.get('codItemCatalogo'), item.get('descricaoResumida'), item.get('materialOuServicoNome')) for item in itens_data if item.get('codItemCatalogo')]))
         upsert_data(conn, 'itens_catalogo', ['codigo', 'descricao', 'tipo'], catalogo_para_db, ['codigo'], ['descricao', 'tipo'])
-
-        itens_para_db = [(
-            item.get('idCompraItem'), item.get('idCompra'), item.get('codItemCatalogo'), item.get('numeroItemCompra'),
-            item.get('numeroItemPncp'), item.get('descricaodetalhada'), item.get('unidadeMedida'), item.get('quantidade'),
-            item.get('valorUnitarioEstimado'), item.get('valorTotal'), item.get('criterioJulgamentoNome'),
-            item.get('situacaoCompraItemNome'), item.get('temResultado'), item.get('dataAtualizacaoPncp')
-        ) for item in itens_data]
+        itens_para_db = [(item.get('idCompraItem'), item.get('idCompra'), item.get('codItemCatalogo'), item.get('numeroItemCompra'), item.get('numeroItemPncp'), item.get('descricaodetalhada'), item.get('unidadeMedida'), item.get('quantidade'), item.get('valorUnitarioEstimado'), item.get('valorTotal'), item.get('criterioJulgamentoNome'), item.get('situacaoCompraItemNome'), item.get('temResultado'), item.get('dataAtualizacaoPncp')) for item in itens_data]
         item_cols = ['id', 'id_compra', 'item_catalogo_codigo', 'numero_item_compra', 'numero_item_pncp', 'descricao_item', 'unidade_medida', 'quantidade', 'valor_unitario_estimado', 'valor_total_estimado', 'criterio_julgamento', 'situacao_item', 'tem_resultado', 'data_atualizacao_item']
         upsert_data(conn, 'itens_compra', item_cols, itens_para_db, ['id'], [col for col in item_cols if col != 'id'])
-
-    # 4. Fornecedores e Resultados
     if resultados_data:
-        fornecedores_para_db = list(set([(
-            res.get('niFornecedor'), 
-            res.get('nomeRazaoSocialFornecedor'), 
-            res.get('tipoPessoa', ''),
-            res.get('porteFornecedorId'), 
-            res.get('porteFornecedorNome')
-        ) for res in resultados_data if res.get('niFornecedor')]))
+        fornecedores_para_db = list(set([(res.get('niFornecedor'), res.get('nomeRazaoSocialFornecedor'), res.get('tipoPessoa', ''), res.get('porteFornecedorId'), res.get('porteFornecedorNome')) for res in resultados_data if res.get('niFornecedor')]))
         upsert_data(conn, 'fornecedores', ['ni', 'nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'], fornecedores_para_db, ['ni'], ['nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'])
-
-        resultados_para_db = [(
-            res.get('idCompraItem'), res.get('sequencialResultado'), res.get('niFornecedor'), res.get('ordemClassificacaoSrp'),
-            res.get('quantidadeHomologada'), res.get('valorUnitarioHomologado'), res.get('valorTotalHomologado'),
-            res.get('percentualDesconto'), res.get('situacaoCompraItemResultadoNome'), res.get('motivoCancelamento'), res.get('dataResultadoPncp')
-        ) for res in resultados_data]
+        resultados_para_db = [(res.get('idCompraItem'), res.get('sequencialResultado'), res.get('niFornecedor'), res.get('ordemClassificacaoSrp'), res.get('quantidadeHomologada'), res.get('valorUnitarioHomologado'), res.get('valorTotalHomologado'), res.get('percentualDesconto'), res.get('situacaoCompraItemResultadoNome'), res.get('motivoCancelamento'), res.get('dataResultadoPncp')) for res in resultados_data]
         res_cols = ['id_item_compra', 'sequencial_resultado', 'ni_fornecedor', 'ordem_classificacao_srp', 'quantidade_homologada', 'valor_unitario_homologado', 'valor_total_homologado', 'percentual_desconto', 'situacao_resultado_nome', 'motivo_cancelamento', 'data_resultado_pncp']
         upsert_data(conn, 'resultados_itens', res_cols, resultados_para_db, ['id_item_compra', 'sequencial_resultado'], [col for col in res_cols if col not in ['id_item_compra', 'sequencial_resultado']])
 
@@ -176,11 +125,17 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
 
         compra = contratacao_json['resultado'][0]
         api_update_date_str = compra.get('dataAtualizacaoPncp')
+        api_update_date = None
         
         try:
-            api_update_date = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00')) if api_update_date_str else None
-        except (ValueError, TypeError):
-            api_update_date = None
+            if api_update_date_str:
+                api_update_date = datetime.fromisoformat(api_update_date_str.replace('Z', '+00:00'))
+        except (ValueError, TypeError) as e:
+            logging.error(f"Não foi possível converter a data da API '{api_update_date_str}': {e}")
+
+        # <<< LOGS DE DEPURAÇÃO ADICIONADOS AQUI >>>
+        logging.info(f"DEPURAÇÃO: db_update_date = {db_update_date} (Tipo: {type(db_update_date)})")
+        logging.info(f"DEPURAÇÃO: api_update_date = {api_update_date} (Tipo: {type(api_update_date)})")
 
         if db_update_date and api_update_date and db_update_date >= api_update_date:
             logging.info(f"Dados para idCompra {id_compra} já estão atualizados. Pulando.")
@@ -197,26 +152,19 @@ async def processar_contratacao_async(session, semaphore, conn, id_compra):
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
 
 # --- Função Principal Assíncrona ---
-
 async def main_async():
-    """Função principal que orquestra o processo de forma assíncrona."""
     conn = get_db_connection()
     if not conn:
         return
 
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-    
     async with aiohttp.ClientSession() as session:
         try:
             with open('idCompra_lista.txt', 'r') as f:
                 id_compras = [line.strip() for line in f if line.strip()]
-            
             logging.info(f"Encontrados {len(id_compras)} IDs de compra para processar.")
-            
             tasks = [processar_contratacao_async(session, semaphore, conn, id_compra) for id_compra in id_compras]
-            
             await asyncio.gather(*tasks)
-                
         except FileNotFoundError:
             logging.error("Arquivo 'idCompra_lista.txt' não encontrado.")
         finally:
