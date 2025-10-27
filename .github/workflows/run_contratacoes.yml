@@ -1,0 +1,35 @@
+# Nome do Workflow: Atualiza Contratações (PNCP)
+name: Atualizar Banco de Dados - Contratações
+
+# Gatilhos (Triggers)
+on:
+  # Permite acionar manualmente pela interface do GitHub
+  workflow_dispatch:
+
+  # Aciona automaticamente em um agendamento (schedule)
+  schedule:
+    # Roda a cada 6 horas (às 00:00, 06:00, 12:00, 18:00 UTC)
+    - cron: '0 */6 * * *'
+
+jobs:
+  # Nome do Job
+  atualizar-contratacoes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout do código do repositório
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar ambiente Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip' # Adiciona cache para acelerar a instalação de dependências
+
+      - name: 3. Instalar dependências Python
+        run: pip install -r requirements.txt
+
+      - name: 4. Executar script de atualização de contratações
+        # Define a variável de ambiente a partir do GitHub Secret
+        env:
+          COCKROACHDB_CONN_STRING: ${{ secrets.COCKROACHDB_CONN_STRING }}
+        run: python atualizar_contratacoes.py
