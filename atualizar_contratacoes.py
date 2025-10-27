@@ -1,5 +1,3 @@
-# Arquivo: atualizar_contratacoes.py (Versão Simplificada e Final)
-
 import os
 import aiohttp
 import asyncio
@@ -7,7 +5,7 @@ import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 
 # --- Configuração Inicial ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
@@ -17,7 +15,18 @@ CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 API_BASE_URL = "https://dadosabertos.compras.gov.br/modulo-contratacoes"
 CONCURRENT_REQUESTS_LIMIT = 10
 
-# --- Funções de Banco de Dados ---
+ARQUIVO_ATIVAS = 'idCompra_ativas.txt'
+ARQUIVO_ARQUIVADAS = 'idCompra_arquivadas.txt'
+
+STATUS_CONCLUIDO = [
+    "homologado", 
+    "contratação finalizada", 
+    "adjudicado", 
+    "divulgado resultado de julgamento"
+]
+
+# --- Funções de Banco de Dados e API ---
+
 def get_db_connection():
     if not CONN_STRING:
         logging.error("String de conexão COCKROACHDB_CONN_STRING não encontrada.")
@@ -30,6 +39,30 @@ def get_db_connection():
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
+# <<< NOVA FUNÇÃO DE VERIFICAÇÃO >>>
+def verificar_se_compra_esta_ativa_no_db(conn, id_compra):
+    """
+    Verifica no DB se algum item da compra tem o status 'em andamento'.
+    Retorna True se encontrar, False caso contrário.
+    """
+    with conn.cursor() as cur:
+        query = """
+            SELECT EXISTS (
+                SELECT 1 
+                FROM itens_compra 
+                WHERE id_compra = %s AND situacao_item ILIKE '%%em andamento%%'
+            );
+        """
+        cur.execute(query, (id_compra,))
+        result = cur.fetchone()
+        
+        if result and result[0]:
+            logging.info(f"Compra {id_compra} tem itens 'em andamento' no DB. Verificação de API necessária.")
+            return True
+        
+        logging.info(f"Compra {id_compra} não tem itens 'em andamento' no DB. Pulando chamadas de API para esta execução.")
+        return False
+
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     if not data: return 0
     cols_str = ", ".join(columns)
@@ -40,7 +73,6 @@ def upsert_data(conn, table, columns, data, conflict_target, update_columns):
         try:
             extras.execute_values(cur, query, data)
             conn.commit()
-            # Log um pouco menos verboso para não poluir
             if cur.rowcount > 0:
                 logging.info(f"{cur.rowcount} registros afetados na tabela {table}.")
             return cur.rowcount
@@ -49,7 +81,6 @@ def upsert_data(conn, table, columns, data, conflict_target, update_columns):
             conn.rollback()
             return 0
 
-# --- Funções de API Assíncronas ---
 async def fetch_api_data_async(session, endpoint, params):
     url = f"{API_BASE_URL}/{endpoint}"
     try:
@@ -60,7 +91,6 @@ async def fetch_api_data_async(session, endpoint, params):
         logging.error(f"Erro em fetch_api_data_async para {url}: {e}")
         return None
 
-# --- Funções de Processamento e Persistência ---
 def persistir_dados(conn, compra_data, itens_data, resultados_data):
     api_update_date_obj = None
     api_update_date_str = compra_data.get('dataAtualizacaoPncp')
@@ -92,50 +122,97 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
         res_cols = ['id_item_compra', 'sequencial_resultado', 'ni_fornecedor', 'ordem_classificacao_srp', 'quantidade_homologada', 'valor_unitario_homologado', 'valor_total_homologado', 'percentual_desconto', 'situacao_resultado_nome', 'motivo_cancelamento', 'data_resultado_pncp']
         upsert_data(conn, 'resultados_itens', res_cols, resultados_para_db, ['id_item_compra', 'sequencial_resultado'], [col for col in res_cols if col not in ['id_item_compra', 'sequencial_resultado']])
 
+
 async def processar_contratacao_async(session, semaphore, conn, id_compra):
+    """
+    Processa uma contratação e retorna True se ela deve ser arquivada.
+    """
     async with semaphore:
         logging.info(f"Processando idCompra: {id_compra}")
-        
-        # <<< LÓGICA DE COMPARAÇÃO REMOVIDA >>>
-        # Agora, sempre buscamos os dados e deixamos o banco decidir se atualiza.
-        
+
+        # <<< NOVA LÓGICA DE VERIFICAÇÃO APLICADA AQUI >>>
+        # Se a compra não tiver itens "em andamento" no nosso DB, pula as chamadas de API.
+        # No entanto, ainda precisamos saber se ela deve ser arquivada.
+        # Para isso, precisamos dos dados da API. Então, a verificação só nos poupa
+        # de re-processar compras que já sabemos que estão inativas, mas que ainda não foram arquivadas.
+        # Uma compra sem itens "em andamento" não será arquivada nesta execução, pois não teremos
+        # o status final dela vindo da API. Isso é seguro.
+        if not verificar_se_compra_esta_ativa_no_db(conn, id_compra):
+            return False # Retorna False para não arquivar e para de processar esta compra.
+
         params = {'tipo': 'idCompra', 'codigo': id_compra}
         contratacao_json = await fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
         
         if not contratacao_json or not contratacao_json.get('resultado'):
-            logging.warning(f"Nenhuma contratação encontrada para idCompra: {id_compra}")
-            return
+            logging.warning(f"Nenhuma contratação encontrada na API para idCompra: {id_compra}. Não será arquivada.")
+            return False
 
         compra = contratacao_json['resultado'][0]
         
         logging.info(f"Buscando sub-dados para idCompra {id_compra}...")
-
         itens_task = fetch_api_data_async(session, "2.1_consultarItensContratacoes_PNCP_14133_Id", params)
         resultados_task = fetch_api_data_async(session, "3.1_consultarResultadoItensContratacoes_PNCP_14133_Id", params)
-        
         itens_json, resultados_json = await asyncio.gather(itens_task, resultados_task)
         
         persistir_dados(conn, compra, itens_json.get('resultado', []), resultados_json.get('resultado', []))
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
 
+        situacao = compra.get('situacaoCompraNomePncp', '').lower()
+        excluida = compra.get('contratacaoExcluida', False)
+
+        if excluida or situacao in STATUS_CONCLUIDO:
+            logging.info(f"Contratação {id_compra} marcada para arquivamento. Status: '{situacao}', Excluída: {excluida}.")
+            return True
+        
+        return False
+
 # --- Função Principal Assíncrona ---
 async def main_async():
     conn = get_db_connection()
     if not conn: return
+    
+    try:
+        with open(ARQUIVO_ATIVAS, 'r') as f:
+            id_compras_ativas = {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        logging.error(f"Arquivo '{ARQUIVO_ATIVAS}' não encontrado. Criando um arquivo vazio.")
+        id_compras_ativas = set()
+        open(ARQUIVO_ATIVAS, 'w').close()
+
+    if not id_compras_ativas:
+        logging.info("Nenhuma compra ativa para processar.")
+        conn.close()
+        return
+
+    logging.info(f"Encontrados {len(id_compras_ativas)} IDs de compra ativos para processar.")
+    
     semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
     async with aiohttp.ClientSession() as session:
-        try:
-            with open('idCompra_lista.txt', 'r') as f:
-                id_compras = [line.strip() for line in f if line.strip()]
-            logging.info(f"Encontrados {len(id_compras)} IDs de compra para processar.")
-            tasks = [processar_contratacao_async(session, semaphore, conn, id_compra) for id_compra in id_compras]
-            await asyncio.gather(*tasks)
-        except FileNotFoundError:
-            logging.error("Arquivo 'idCompra_lista.txt' não encontrado.")
-        finally:
-            if conn:
-                conn.close()
-                logging.info("Conexão com o banco de dados fechada.")
+        tasks = [asyncio.create_task(processar_contratacao_async(session, semaphore, conn, id_compra), name=id_compra) for id_compra in id_compras_ativas]
+        results = await asyncio.gather(*tasks)
+
+    conn.close()
+    logging.info("Conexão com o banco de dados fechada.")
+
+    ids_para_arquivar = set()
+    for i, task in enumerate(tasks):
+        id_compra = task.get_name()
+        deve_arquivar = results[i]
+        if deve_arquivar:
+            ids_para_arquivar.add(id_compra)
+
+    if ids_para_arquivar:
+        logging.info(f"Arquivando {len(ids_para_arquivar)} IDs de compra concluídos.")
+        id_compras_final = id_compras_ativas - ids_para_arquivar
+        with open(ARQUIVO_ATIVAS, 'w') as f:
+            for id_compra in sorted(list(id_compras_final)):
+                f.write(id_compra + '\n')
+        with open(ARQUIVO_ARQUIVADAS, 'a') as f:
+            for id_compra in sorted(list(ids_para_arquivar)):
+                f.write(id_compra + '\n')
+        logging.info("Arquivos de listas de IDs atualizados.")
+    else:
+        logging.info("Nenhuma compra para arquivar nesta execução.")
 
 if __name__ == "__main__":
     asyncio.run(main_async())
