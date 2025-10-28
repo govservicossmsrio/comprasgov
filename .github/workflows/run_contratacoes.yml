@@ -33,3 +33,18 @@ jobs:
         env:
           COCKROACHDB_CONN_STRING: ${{ secrets.COCKROACHDB_CONN_STRING }}
         run: python atualizar_contratacoes.py
+
+      # <<< PASSO ADICIONADO AQUI >>>
+      - name: 5. Fazer commit e push das listas atualizadas
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          # Mensagem do commit que aparecerá no histórico do Git
+          commit_message: "CI: Atualiza listas de compras ativas e arquivadas"
+          
+          # Padrão de arquivos para incluir no commit. Neste caso, todos os .txt
+          file_pattern: "*.txt"
+          
+          # Informações do autor do commit (para identificar que foi o bot)
+          commit_user_name: "GitHub Actions Bot"
+          commit_user_email: "actions@github.com"
+          commit_author: "GitHub Actions Bot <actions@github.com>"
