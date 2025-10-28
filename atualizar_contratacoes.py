@@ -1,4 +1,4 @@
-# Arquivo: atualizar_contratacoes.py (Versão Robusta Final)
+# Arquivo: atualizar_contratacoes.py (Versão com Arquivamento Inteligente por Status de Item)
 
 import os
 import aiohttp
@@ -15,13 +15,14 @@ load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 API_BASE_URL = "https://dadosabertos.compras.gov.br/modulo-contratacoes"
-CONCURRENT_REQUESTS_LIMIT = 5 # Reduzido para ser mais 'gentil' com a API
-TIMEOUT_API = aiohttp.ClientTimeout(total=60) # Timeout de 60 segundos para cada requisição
+CONCURRENT_REQUESTS_LIMIT = 5
+TIMEOUT_API = aiohttp.ClientTimeout(total=60)
 
 ARQUIVO_ATIVAS = 'idCompra_ativas.txt'
 ARQUIVO_ARQUIVADAS = 'idCompra_arquivadas.txt'
 
-STATUS_CONCLUIDO = ["homologado", "contratação finalizada", "adjudicado", "divulgado resultado de julgamento"]
+# <<< LISTA DE STATUS DE ITENS QUE INDICAM QUE O ITEM FOI RESOLVIDO >>>
+STATUS_ITEM_RESOLVIDO = ("homologado", "fracassado", "deserto", "anulado/revogado/cancelado")
 
 # --- Funções de Banco de Dados e API ---
 
@@ -37,27 +38,46 @@ def get_db_connection():
         logging.error(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
-def verificar_se_deve_buscar_api(conn, id_compra):
+def verificar_se_compra_esta_concluida_no_db(conn, id_compra):
+    """
+    Verifica no DB se TODOS os itens de uma compra têm um status considerado "resolvido".
+    Retorna True se a compra pode ser arquivada, False caso contrário.
+    """
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT EXISTS (SELECT 1 FROM compras WHERE id = %s);", (id_compra,))
-            compra_existe = cur.fetchone()[0]
-            if not compra_existe:
-                logging.info(f"Compra {id_compra} é nova. Busca na API necessária.")
-                return True
-            query = "SELECT EXISTS (SELECT 1 FROM itens_compra WHERE id_compra = %s AND situacao_item ILIKE '%%em andamento%%');"
-            cur.execute(query, (id_compra,))
-            tem_itens_em_andamento = cur.fetchone()[0]
-            if tem_itens_em_andamento:
-                logging.info(f"Compra {id_compra} existe e tem itens 'em andamento'. Busca na API necessária.")
-                return True
-            else:
-                logging.info(f"Compra {id_compra} existe, mas não tem itens 'em andamento'. Pulando API.")
+            # 1. Verifica se a compra existe e tem itens. Se não tiver itens, não podemos decidir.
+            cur.execute("SELECT EXISTS (SELECT 1 FROM itens_compra WHERE id_compra = %s);", (id_compra,))
+            tem_itens = cur.fetchone()[0]
+            if not tem_itens:
+                logging.info(f"Compra {id_compra} é nova ou não tem itens no DB. Não será arquivada por enquanto.")
                 return False
-    except psycopg2.Error as e:
-        logging.error(f"Erro de banco de dados ao verificar status da compra {id_compra}: {e}. Forçando busca na API por segurança.")
-        return True
 
+            # 2. Verifica se existe PELO MENOS UM item que NÃO TENHA um status resolvido.
+            query = """
+                SELECT EXISTS (
+                    SELECT 1 
+                    FROM itens_compra 
+                    WHERE id_compra = %s 
+                    AND lower(situacao_item) NOT IN %s
+                );
+            """
+            cur.execute(query, (id_compra, STATUS_ITEM_RESOLVIDO))
+            tem_item_ativo = cur.fetchone()[0]
+            
+            # Se existe um item ativo, a compra NÃO está concluída.
+            if tem_item_ativo:
+                logging.info(f"Compra {id_compra} ainda tem itens ativos. Verificação de API necessária.")
+                return False
+            else:
+                # Se NENHUM item ativo foi encontrado, significa que TODOS estão resolvidos.
+                logging.info(f"Todos os itens da compra {id_compra} estão resolvidos. Marcada para arquivamento.")
+                return True
+                
+    except psycopg2.Error as e:
+        logging.error(f"Erro de DB ao verificar status da compra {id_compra}: {e}. A compra não será arquivada por segurança.")
+        return False
+
+# ... (As funções upsert_data, fetch_api_data_async, persistir_dados permanecem as mesmas da versão anterior)
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     if not data: return 0
     cols_str = ", ".join(columns)
@@ -112,57 +132,46 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
     upsert_data(conn, 'compras', compra_cols, compra_para_db, ['id'], [col for col in compra_cols if col != 'id'])
     
     if itens_data:
-        # <<< CORREÇÃO DE DUPLICATAS >>>
         itens_unicos = {item['idCompraItem']: item for item in itens_data}.values()
-        
         catalogo_para_db = list(set([(item.get('codItemCatalogo'), item.get('descricaoResumida'), item.get('materialOuServicoNome')) for item in itens_unicos if item.get('codItemCatalogo')]))
         upsert_data(conn, 'itens_catalogo', ['codigo', 'descricao', 'tipo'], catalogo_para_db, ['codigo'], ['descricao', 'tipo'])
-        
         itens_para_db = [(item.get('idCompraItem'), item.get('idCompra'), item.get('codItemCatalogo'), item.get('numeroItemCompra'), item.get('numeroItemPncp'), item.get('descricaodetalhada'), item.get('unidadeMedida'), item.get('quantidade'), item.get('valorUnitarioEstimado'), item.get('valorTotal'), item.get('criterioJulgamentoNome'), item.get('situacaoCompraItemNome'), item.get('temResultado'), item.get('dataAtualizacaoPncp')) for item in itens_unicos]
         item_cols = ['id', 'id_compra', 'item_catalogo_codigo', 'numero_item_compra', 'numero_item_pncp', 'descricao_item', 'unidade_medida', 'quantidade', 'valor_unitario_estimado', 'valor_total_estimado', 'criterio_julgamento', 'situacao_item', 'tem_resultado', 'data_atualizacao_item']
         upsert_data(conn, 'itens_compra', item_cols, itens_para_db, ['id'], [col for col in item_cols if col != 'id'])
         
     if resultados_data:
-        # <<< CORREÇÃO DE DUPLICATAS >>>
         resultados_unicos = {f"{res['idCompraItem']}-{res['sequencialResultado']}": res for res in resultados_data}.values()
-
         fornecedores_para_db = list(set([(res.get('niFornecedor'), res.get('nomeRazaoSocialFornecedor'), res.get('tipoPessoa', ''), res.get('porteFornecedorId'), res.get('porteFornecedorNome')) for res in resultados_unicos if res.get('niFornecedor')]))
         upsert_data(conn, 'fornecedores', ['ni', 'nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'], fornecedores_para_db, ['ni'], ['nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'])
-        
         resultados_para_db = [(res.get('idCompraItem'), res.get('sequencialResultado'), res.get('niFornecedor'), res.get('ordemClassificacaoSrp'), res.get('quantidadeHomologada'), res.get('valorUnitarioHomologado'), res.get('valorTotalHomologado'), res.get('percentualDesconto'), res.get('situacaoCompraItemResultadoNome'), res.get('motivoCancelamento'), res.get('dataResultadoPncp')) for res in resultados_unicos]
         res_cols = ['id_item_compra', 'sequencial_resultado', 'ni_fornecedor', 'ordem_classificacao_srp', 'quantidade_homologada', 'valor_unitario_homologado', 'valor_total_homologado', 'percentual_desconto', 'situacao_resultado_nome', 'motivo_cancelamento', 'data_resultado_pncp']
         upsert_data(conn, 'resultados_itens', res_cols, resultados_para_db, ['id_item_compra', 'sequencial_resultado'], [col for col in res_cols if col not in ['id_item_compra', 'sequencial_resultado']])
 
-async def processar_contratacao_async(session, semaphore, conn, id_compra):
+async def processar_contratacao_ativa_async(session, semaphore, conn, id_compra):
+    """
+    Busca e persiste os dados de uma contratação que foi considerada ativa.
+    """
     async with semaphore:
-        logging.info(f"Processando idCompra: {id_compra}")
-        if not verificar_se_deve_buscar_api(conn, id_compra):
-            return False
+        logging.info(f"Processando API para idCompra ativa: {id_compra}")
         params = {'tipo': 'idCompra', 'codigo': id_compra}
-        contratacao_json = await fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
-        if not contratacao_json or not contratacao_json.get('resultado'):
-            logging.warning(f"Nenhuma contratação encontrada na API para idCompra: {id_compra}. Não será arquivada.")
-            return False
-        compra = contratacao_json['resultado'][0]
-        logging.info(f"Buscando sub-dados para idCompra {id_compra}...")
+        
+        # Busca todos os dados em paralelo
+        contratacao_task = fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
         itens_task = fetch_api_data_async(session, "2.1_consultarItensContratacoes_PNCP_14133_Id", params)
         resultados_task = fetch_api_data_async(session, "3.1_consultarResultadoItensContratacoes_PNCP_14133_Id", params)
-        itens_json, resultados_json = await asyncio.gather(itens_task, resultados_task)
+        contratacao_json, itens_json, resultados_json = await asyncio.gather(contratacao_task, itens_task, resultados_task)
         
-        # <<< CORREÇÃO DE FALHA DE API >>>
-        # Verifica se as chamadas retornaram dados antes de tentar persistir
+        # Validação dos dados recebidos
+        if not contratacao_json or not contratacao_json.get('resultado'):
+            logging.warning(f"Não foi possível obter dados da contratação principal para {id_compra}. A atualização falhou.")
+            return
+
+        compra = contratacao_json['resultado'][0]
         itens_data = itens_json.get('resultado', []) if itens_json else []
         resultados_data = resultados_json.get('resultado', []) if resultados_json else []
         
         persistir_dados(conn, compra, itens_data, resultados_data)
         logging.info(f"Processo de persistência para idCompra {id_compra} concluído.")
-        
-        situacao = compra.get('situacaoCompraNomePncp', '').lower()
-        excluida = compra.get('contratacaoExcluida', False)
-        if excluida or situacao in STATUS_CONCLUIDO:
-            logging.info(f"Contratação {id_compra} marcada para arquivamento. Status: '{situacao}', Excluída: {excluida}.")
-            return True
-        return False
 
 async def main_async():
     conn = None
@@ -172,44 +181,54 @@ async def main_async():
         
         try:
             with open(ARQUIVO_ATIVAS, 'r') as f:
-                id_compras_ativas = {line.strip() for line in f if line.strip()}
+                id_compras_todas = {line.strip() for line in f if line.strip()}
         except FileNotFoundError:
             logging.error(f"Arquivo '{ARQUIVO_ATIVAS}' não encontrado. Criando um arquivo vazio.")
-            id_compras_ativas = set()
+            id_compras_todas = set()
             open(ARQUIVO_ATIVAS, 'w').close()
 
-        if not id_compras_ativas:
+        if not id_compras_todas:
             logging.info("Nenhuma compra ativa para processar.")
             return
 
-        logging.info(f"Encontrados {len(id_compras_ativas)} IDs de compra ativos para processar.")
+        logging.info(f"Encontrados {len(id_compras_todas)} IDs de compra para verificação.")
         
-        semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
-        async with aiohttp.ClientSession() as session:
-            tasks = [asyncio.create_task(processar_contratacao_async(session, semaphore, conn, id_compra), name=id_compra) for id_compra in id_compras_ativas]
-            results = await asyncio.gather(*tasks, return_exceptions=True) # return_exceptions=True
-
+        # <<< NOVA LÓGICA DE SEPARAÇÃO >>>
         ids_para_arquivar = set()
-        for i, task in enumerate(tasks):
-            id_compra = task.get_name()
-            result = results[i]
-            if isinstance(result, Exception):
-                logging.error(f"Tarefa para idCompra {id_compra} falhou com uma exceção: {result}")
-            elif result: # Se o resultado for True
-                ids_para_arquivar.add(id_compra)
+        ids_para_processar_api = set()
 
+        for id_compra in id_compras_todas:
+            if verificar_se_compra_esta_concluida_no_db(conn, id_compra):
+                ids_para_arquivar.add(id_compra)
+            else:
+                ids_para_processar_api.add(id_compra)
+        
+        # Processa apenas as compras que ainda estão ativas
+        if ids_para_processar_api:
+            logging.info(f"Iniciando processamento de API para {len(ids_para_processar_api)} compras ativas.")
+            semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
+            async with aiohttp.ClientSession() as session:
+                tasks = [processar_contratacao_ativa_async(session, semaphore, conn, id_compra) for id_compra in ids_para_processar_api]
+                await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            logging.info("Nenhuma compra ativa necessitando de atualização via API nesta execução.")
+
+        # Atualiza os arquivos de lista no final
         if ids_para_arquivar:
             logging.info(f"Arquivando {len(ids_para_arquivar)} IDs de compra concluídos.")
-            id_compras_final = id_compras_ativas - ids_para_arquivar
+            
+            # Garante que os IDs a serem arquivados não permaneçam na lista de ativos
+            ids_ativos_final = id_compras_todas - ids_para_arquivar
+            
             with open(ARQUIVO_ATIVAS, 'w') as f:
-                for id_compra in sorted(list(id_compras_final)):
-                    f.write(id_compra + '\n')
+                for id_c in sorted(list(ids_ativos_final)):
+                    f.write(id_c + '\n')
             with open(ARQUIVO_ARQUIVADAS, 'a') as f:
-                for id_compra in sorted(list(ids_para_arquivar)):
-                    f.write(id_compra + '\n')
+                for id_c in sorted(list(ids_para_arquivar)):
+                    f.write(id_c + '\n')
             logging.info("Arquivos de listas de IDs atualizados.")
         else:
-            logging.info("Nenhuma compra para arquivar nesta execução.")
+            logging.info("Nenhuma compra nova para arquivar nesta execução.")
             
     finally:
         if conn:
