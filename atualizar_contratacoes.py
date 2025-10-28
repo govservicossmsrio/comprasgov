@@ -1,4 +1,4 @@
-# Arquivo: atualizar_contratacoes.py (Versão com Controle de Rate Limit)
+# Arquivo: atualizar_contratacoes.py (Versão com Correção de Duplicatas no Catálogo)
 
 import os
 import aiohttp
@@ -16,20 +16,19 @@ load_dotenv(dotenv_path='dbconnection.env')
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 API_BASE_URL = "https://dadosabertos.compras.gov.br/modulo-contratacoes"
 
-# <<< AJUSTES DE RATE LIMIT >>>
-CONCURRENT_REQUESTS_LIMIT = 2  # Reduzido drasticamente para evitar 'Too Many Requests'
-DELAY_BETWEEN_TASKS = 0.1      # Pequeno atraso entre o início de cada tarefa de compra
-
-TIMEOUT_API = aiohttp.ClientTimeout(total=90) # Aumentado para 90s para dar mais folga
+CONCURRENT_REQUESTS_LIMIT = 2
+DELAY_BETWEEN_TASKS = 0.1
+TIMEOUT_API = aiohttp.ClientTimeout(total=90)
 
 ARQUIVO_ATIVAS = 'idCompra_ativas.txt'
 ARQUIVO_ARQUIVADAS = 'idCompra_arquivadas.txt'
 
 STATUS_ITEM_RESOLVIDO = ("homologado", "fracassado", "deserto", "anulado/revogado/cancelado")
 
-# --- Funções de Banco de Dados e API ---
+# --- Funções ---
 
 def get_db_connection():
+    # (código sem alterações)
     if not CONN_STRING:
         logging.error("String de conexão COCKROACHDB_CONN_STRING não encontrada.")
         return None
@@ -42,6 +41,7 @@ def get_db_connection():
         return None
 
 def verificar_se_compra_esta_concluida_no_db(conn, id_compra):
+    # (código sem alterações)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT EXISTS (SELECT 1 FROM itens_compra WHERE id_compra = %s);", (id_compra,))
@@ -72,8 +72,8 @@ def verificar_se_compra_esta_concluida_no_db(conn, id_compra):
         logging.error(f"Erro de DB ao verificar status da compra {id_compra}: {e}. A compra não será arquivada por segurança.")
         return False
 
-# ... (As funções upsert_data, fetch_api_data_async, persistir_dados permanecem as mesmas)
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
+    # (código sem alterações)
     if not data: return 0
     cols_str = ", ".join(columns)
     update_str = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
@@ -92,12 +92,13 @@ def upsert_data(conn, table, columns, data, conflict_target, update_columns):
             return 0
 
 async def fetch_api_data_async(session, endpoint, params):
+    # (código sem alterações)
     url = f"{API_BASE_URL}/{endpoint}"
     try:
         async with session.get(url, params=params, timeout=TIMEOUT_API) as response:
             if response.status == 429:
                 logging.error(f"Erro 429 (Too Many Requests) para a URL: {response.url}. O servidor está sobrecarregado.")
-                return None # Retorna None para que a falha seja tratada
+                return None
             response.raise_for_status()
             return await response.json(content_type=None)
     except asyncio.TimeoutError:
@@ -110,7 +111,9 @@ async def fetch_api_data_async(session, endpoint, params):
         logging.error(f"Erro inesperado em fetch_api_data_async para {url}: {e}")
         return None
 
+# <<< MUDANÇA APLICADA AQUI >>>
 def persistir_dados(conn, compra_data, itens_data, resultados_data):
+    # (código de data, orgao, unidade, compra sem alterações)
     api_update_date_obj = None
     api_update_date_str = compra_data.get('dataAtualizacaoPncp')
     if api_update_date_str:
@@ -130,14 +133,20 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
     upsert_data(conn, 'compras', compra_cols, compra_para_db, ['id'], [col for col in compra_cols if col != 'id'])
     
     if itens_data:
-        itens_unicos = {item['idCompraItem']: item for item in itens_data}.values()
-        catalogo_para_db = list(set([(item.get('codItemCatalogo'), item.get('descricaoResumida'), item.get('materialOuServicoNome')) for item in itens_unicos if item.get('codItemCatalogo')]))
+        # <<< CORREÇÃO APLICADA AQUI >>>
+        # Garante que estamos lidando com uma lista única de códigos de catálogo
+        catalogo_unico = {item['codItemCatalogo']: item for item in itens_data if item.get('codItemCatalogo')}.values()
+        catalogo_para_db = [(item.get('codItemCatalogo'), item.get('descricaoResumida'), item.get('materialOuServicoNome')) for item in catalogo_unico]
         upsert_data(conn, 'itens_catalogo', ['codigo', 'descricao', 'tipo'], catalogo_para_db, ['codigo'], ['descricao', 'tipo'])
+        
+        # A lógica de limpeza para itens_compra já estava correta, mas a mantemos por segurança
+        itens_unicos = {item['idCompraItem']: item for item in itens_data}.values()
         itens_para_db = [(item.get('idCompraItem'), item.get('idCompra'), item.get('codItemCatalogo'), item.get('numeroItemCompra'), item.get('numeroItemPncp'), item.get('descricaodetalhada'), item.get('unidadeMedida'), item.get('quantidade'), item.get('valorUnitarioEstimado'), item.get('valorTotal'), item.get('criterioJulgamentoNome'), item.get('situacaoCompraItemNome'), item.get('temResultado'), item.get('dataAtualizacaoPncp')) for item in itens_unicos]
         item_cols = ['id', 'id_compra', 'item_catalogo_codigo', 'numero_item_compra', 'numero_item_pncp', 'descricao_item', 'unidade_medida', 'quantidade', 'valor_unitario_estimado', 'valor_total_estimado', 'criterio_julgamento', 'situacao_item', 'tem_resultado', 'data_atualizacao_item']
         upsert_data(conn, 'itens_compra', item_cols, itens_para_db, ['id'], [col for col in item_cols if col != 'id'])
         
     if resultados_data:
+        # (código sem alterações)
         resultados_unicos = {f"{res['idCompraItem']}-{res['sequencialResultado']}": res for res in resultados_data}.values()
         fornecedores_para_db = list(set([(res.get('niFornecedor'), res.get('nomeRazaoSocialFornecedor'), res.get('tipoPessoa', ''), res.get('porteFornecedorId'), res.get('porteFornecedorNome')) for res in resultados_unicos if res.get('niFornecedor')]))
         upsert_data(conn, 'fornecedores', ['ni', 'nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'], fornecedores_para_db, ['ni'], ['nome_razao_social', 'tipo_pessoa', 'porte_id', 'porte_nome'])
@@ -145,6 +154,7 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
         res_cols = ['id_item_compra', 'sequencial_resultado', 'ni_fornecedor', 'ordem_classificacao_srp', 'quantidade_homologada', 'valor_unitario_homologado', 'valor_total_homologado', 'percentual_desconto', 'situacao_resultado_nome', 'motivo_cancelamento', 'data_resultado_pncp']
         upsert_data(conn, 'resultados_itens', res_cols, resultados_para_db, ['id_item_compra', 'sequencial_resultado'], [col for col in res_cols if col not in ['id_item_compra', 'sequencial_resultado']])
 
+# O resto do script (processar_contratacao_ativa_async, main_async) permanece o mesmo.
 async def processar_contratacao_ativa_async(session, semaphore, conn, id_compra):
     async with semaphore:
         logging.info(f"Processando API para idCompra ativa: {id_compra}")
@@ -203,7 +213,7 @@ async def main_async():
                 for id_compra in ids_para_processar_api:
                     task = asyncio.create_task(processar_contratacao_ativa_async(session, semaphore, conn, id_compra))
                     tasks.append(task)
-                    await asyncio.sleep(DELAY_BETWEEN_TASKS) # <<< Adiciona o atraso aqui
+                    await asyncio.sleep(DELAY_BETWEEN_TASKS)
                 
                 await asyncio.gather(*tasks, return_exceptions=True)
         else:
