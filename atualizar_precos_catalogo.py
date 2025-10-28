@@ -18,7 +18,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
-MAX_CONCURRENT_REQUESTS = 5
+# Reduz a concorrência para respeitar o rate limit da API
+MAX_CONCURRENT_REQUESTS = 3
 TIMEOUT = 90
 
 # --- Funções Auxiliares ---
@@ -28,18 +29,10 @@ def normalizar_nome_coluna(nome: str) -> str:
     return s.lower().strip('_')
 
 def _decode_and_clean_csv(raw_bytes: bytes) -> str:
-    """Função de limpeza inspirada no código funcional fornecido."""
-    decoded_text = ""
-    try:
-        probe = from_bytes(raw_bytes).best()
-        decoded_text = probe.output_as_str if probe else raw_bytes.decode("utf-8", errors="replace")
-    except Exception:
-        decoded_text = raw_bytes.decode("latin-1", errors="replace")
-    
+    decoded_text = from_bytes(raw_bytes).best().output_as_str if from_bytes(raw_bytes).best() else raw_bytes.decode("utf-8", errors="replace")
     fixed_text_content = fix_text(decoded_text)
     lines = fixed_text_content.strip().splitlines()
-    if lines and "totalRegistros" in lines[-1] and "dataHoraConsulta" in lines[-1]:
-        lines.pop()
+    if lines and "totalRegistros" in lines[-1]: lines.pop()
     return "\n".join(lines)
 
 # --- Funções de Banco de Dados ---
@@ -60,16 +53,15 @@ def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, pre
     
     with psycopg2.connect(conn_string) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            precos_db_map = {}
-            cur.execute("SELECT * FROM precos_catalogo WHERE codigo_item_catalogo = %s", (codigo_item,))
-            for row in cur:
-                chave = f"{row['id_compra']}-{row['ni_fornecedor']}"
-                precos_db_map[chave] = row
+            # >>> A CORREÇÃO FINAL E DECISIVA ESTÁ AQUI <<<
+            # Força o parâmetro a ser tratado como VARCHAR na comparação
+            cur.execute("SELECT * FROM precos_catalogo WHERE codigo_item_catalogo = %s::VARCHAR", (codigo_item,))
+            
+            precos_db_map = {f"{row['id_compra']}-{row['ni_fornecedor']}": row for row in cur}
 
             precos_para_inserir, precos_para_atualizar = [], []
             for p in precos_api:
-                id_compra_api = p.get('numero_compra', '')
-                ni_fornecedor_api = p.get('cnpj_vencedor', '')
+                id_compra_api, ni_fornecedor_api = p.get('numero_compra', ''), p.get('cnpj_vencedor', '')
                 if not id_compra_api or not ni_fornecedor_api: continue
                 chave_api = f"{id_compra_api}-{ni_fornecedor_api}"
                 try: valor_unitario_api = float(p.get('valor_unitario_homologado', 0))
@@ -83,84 +75,51 @@ def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, pre
                         precos_para_atualizar.append(p)
             
             if precos_para_inserir:
-                dados_insert = [(
-                    codigo_item, tipo_item, p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'),
-                    p.get('quantidade_item'), p.get('valor_unitario_homologado'), p.get('valor_total_homologado'),
-                    p.get('cnpj_vencedor'), p.get('nome_vencedor'), p.get('numero_compra'),
-                    p.get('data_resultado'), datetime.now()
-                ) for p in precos_para_inserir]
+                dados_insert = [(codigo_item, tipo_item, p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'), p.get('quantidade_item'), p.get('valor_unitario_homologado'), p.get('valor_total_homologado'), p.get('cnpj_vencedor'), p.get('nome_vencedor'), p.get('numero_compra'), p.get('data_resultado'), datetime.now()) for p in precos_para_inserir]
                 psycopg2.extras.execute_values(cur, "INSERT INTO precos_catalogo (codigo_item_catalogo, tipo_item, descricao_item, unidade_medida, quantidade_total, valor_unitario, valor_total, ni_fornecedor, nome_fornecedor, id_compra, data_compra, data_atualizacao) VALUES %s", dados_insert)
                 novos = len(dados_insert)
 
             if precos_para_atualizar:
-                dados_update = [(
-                    p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'), p.get('quantidade_item'), p.get('valor_unitario_homologado'),
-                    p.get('valor_total_homologado'), p.get('nome_vencedor'), p.get('data_resultado'),
-                    codigo_item, p.get('numero_compra'), p.get('cnpj_vencedor')
-                ) for p in precos_para_atualizar]
+                dados_update = [(p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'), p.get('quantidade_item'), p.get('valor_unitario_homologado'), p.get('valor_total_homologado'), p.get('nome_vencedor'), p.get('data_resultado'), codigo_item, p.get('numero_compra'), p.get('cnpj_vencedor')) for p in precos_para_atualizar]
                 psycopg2.extras.execute_batch(cur, "UPDATE precos_catalogo SET descricao_item = %s, unidade_medida = %s, quantidade_total = %s, valor_unitario = %s, valor_total = %s, nome_fornecedor = %s, data_compra = %s, data_atualizacao = CURRENT_TIMESTAMP WHERE codigo_item_catalogo = %s AND id_compra = %s AND ni_fornecedor = %s;", dados_update)
                 atualizados = len(dados_update)
     return novos, atualizados
 
-# --- Função de API Assíncrona (Refatorada) ---
+# --- Função de API Assíncrona ---
 async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, tipo_item: str) -> Optional[List[Dict[str, Any]]]:
     tipo_normalizado = tipo_item.strip().lower()
-    if 'material' in tipo_normalizado:
-        base_url = "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV"
-        endpoint_usado = "MATERIAL (CSV)"
-    elif 'serviço' in tipo_normalizado or 'servico' in tipo_normalizado:
-        base_url = "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV"
-        endpoint_usado = "SERVIÇO (CSV)"
-    else:
-        logging.warning(f"Tipo '{tipo_item}' não reconhecido para item {codigo_item}. Pulando.")
-        return None
-
-    logging.info(f"Buscando item {codigo_item} ({endpoint_usado})")
+    base_url = "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV" if 'material' in tipo_normalizado else "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV"
     
-    all_dfs = []
-    current_page = 1
+    logging.info(f"Buscando item {codigo_item}...")
+    all_dfs, current_page = [], 1
     while True:
         params = {'codigoItemCatalogo': codigo_item, 'pagina': current_page, 'tamanhoPagina': 500}
         try:
             async with session.get(base_url, params=params, headers={'accept': 'text/csv'}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as response:
-                if response.status != 200:
-                    logging.error(f"Item {codigo_item}: Parando na página {current_page}. Status: {response.status}.")
-                    break
+                if response.status == 429:
+                    logging.warning(f"Item {codigo_item}: Rate limit atingido na página {current_page}. Aguardando 5s para tentar novamente...")
+                    await asyncio.sleep(5)
+                    continue # Tenta a mesma página novamente
+                if response.status != 200: break
                 
                 content_bytes = await response.read()
-                if not content_bytes:
-                    logging.info(f"Item {codigo_item}: Fim dos resultados na página {current_page} (resposta vazia).")
-                    break
+                if not content_bytes: break
 
                 cleaned_csv_text = _decode_and_clean_csv(content_bytes)
-                if len(cleaned_csv_text.strip().splitlines()) < 2:
-                    logging.info(f"Item {codigo_item}: Fim dos resultados na página {current_page} (CSV sem dados).")
-                    break
+                if len(cleaned_csv_text.strip().splitlines()) < 2: break
 
-                df_page = pd.read_csv(io.StringIO(cleaned_csv_text), sep=';', on_bad_lines='warn', engine='python')
-                if df_page.empty:
-                    break
+                df_page = pd.read_csv(io.StringIO(cleaned_csv_text), sep=';', on_bad_lines='warn', engine='python', dtype=str) # dtype=str é crucial
+                if df_page.empty: break
 
                 all_dfs.append(df_page)
                 current_page += 1
-                await asyncio.sleep(0.5) # Pequena pausa para não sobrecarregar a API
-
+                await asyncio.sleep(1) # Aumenta a pausa para ser mais gentil com a API
         except Exception as e:
-            logging.error(f"Erro fatal ao processar página {current_page} para item {codigo_item}: {e}", exc_info=True)
-            break # Interrompe a paginação para este item em caso de erro grave
-
-    if not all_dfs:
-        return []
-
+            logging.error(f"Erro ao processar página {current_page} para item {codigo_item}: {e}", exc_info=True)
+            break
+    if not all_dfs: return []
     full_df = pd.concat(all_dfs, ignore_index=True)
     full_df.columns = [normalizar_nome_coluna(col) for col in full_df.columns]
-
-    # >>> A CORREÇÃO DEFINITIVA <<<
-    # Força as colunas que usamos como chaves de texto a serem do tipo string no pandas.
-    for col in ['numero_compra', 'cnpj_vencedor']:
-        if col in full_df.columns:
-            full_df[col] = full_df[col].astype(str).apply(lambda x: x.split('.')[0]) # Converte para string e remove ".0" se for float
-
     full_df = full_df.where(pd.notna(full_df), None)
     precos = full_df.to_dict('records')
     logging.info(f"SUCESSO: Total de {len(precos)} preços processados para o item {codigo_item} em {current_page-1} página(s).")
@@ -178,42 +137,27 @@ async def process_itens_concorrently(conn_string: str, itens: List[Tuple[str, st
                     if precos is not None:
                         try:
                             novos, atualizados = sync_precos_catalogo(conn_string, codigo, tipo, precos)
-                            stats['precos_novos'] += novos
-                            stats['precos_atualizados'] += atualizados
-                            stats['itens_processados'] += 1
-                            if novos > 0 or atualizados > 0:
-                                logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
+                            stats['precos_novos'] += novos; stats['precos_atualizados'] += atualizados; stats['itens_processados'] += 1
+                            if novos > 0 or atualizados > 0: logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
                         except Exception as db_error:
-                            logging.error(f"Erro de banco de dados para item {codigo}: {db_error}")
-                            stats['erros'] += 1
-                    else:
-                        stats['erros'] += 1
+                            logging.error(f"Erro de banco de dados para item {codigo}: {db_error}"); stats['erros'] += 1
+                    else: stats['erros'] += 1
             except Exception as e:
-                logging.error(f"Erro crítico no fluxo do item {codigo}: {e}", exc_info=True)
-                stats['erros'] += 1
+                logging.error(f"Erro crítico no fluxo do item {codigo}: {e}", exc_info=True); stats['erros'] += 1
     tasks = [fetch_and_sync(codigo, tipo) for codigo, tipo in itens]
     await asyncio.gather(*tasks)
     return stats
 
 async def main():
     conn = get_db_connection()
-    if not conn:
-        logging.error("Não foi possível estabelecer a conexão inicial com o banco. Abortando.")
-        return
+    if not conn: logging.error("Abortando."); return
     try:
         itens_para_buscar = get_itens_catalogo_from_db(conn)
-        if not itens_para_buscar:
-            logging.info("Nenhum item encontrado no banco para processar."); return
-    finally:
-        conn.close()
+        if not itens_para_buscar: logging.info("Nenhum item para processar."); return
+    finally: conn.close()
     stats = await process_itens_concorrently(CONN_STRING, itens_para_buscar)
-    logging.info("=" * 60)
-    logging.info("RESUMO FINAL DA SINCRONIZAÇÃO")
-    logging.info(f"Total de itens únicos no banco: {stats['total_itens']}")
-    logging.info(f"Itens processados (chamadas à API): {stats['itens_processados']}")
-    logging.info(f"Novos registros de preço inseridos: {stats['precos_novos']}")
-    logging.info(f"Registros de preço existentes atualizados: {stats['precos_atualizados']}")
-    logging.info(f"Itens com erro no processamento: {stats['erros']}")
+    logging.info("=" * 60 + "\nRESUMO FINAL DA SINCRONIZAÇÃO\n" + "=" * 60)
+    for key, value in stats.items(): logging.info(f"{key.replace('_', ' ').title()}: {value}")
     logging.info("=" * 60)
 
 if __name__ == "__main__":
