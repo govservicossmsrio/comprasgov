@@ -15,6 +15,12 @@ jobs:
   # Nome do Job
   atualizar-contratacoes:
     runs-on: ubuntu-latest
+
+    # <<< SEÇÃO ADICIONADA AQUI >>>
+    # Concede permissões de escrita para que a Action possa fazer o push
+    permissions:
+      contents: write
+
     steps:
       - name: 1. Checkout do código do repositório
         uses: actions/checkout@v4
@@ -34,7 +40,6 @@ jobs:
           COCKROACHDB_CONN_STRING: ${{ secrets.COCKROACHDB_CONN_STRING }}
         run: python atualizar_contratacoes.py
 
-      # <<< PASSO ADICIONADO AQUI >>>
       - name: 5. Fazer commit e push das listas atualizadas
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
