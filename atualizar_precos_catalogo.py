@@ -18,7 +18,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
-# Reduz a concorrência para respeitar o rate limit da API
 MAX_CONCURRENT_REQUESTS = 3
 TIMEOUT = 90
 
@@ -28,8 +27,24 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = nome.strip(); s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s); s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
 
+# =================================================================
+# A ALTERAÇÃO CRÍTICA ESTÁ AQUI
+# =================================================================
 def _decode_and_clean_csv(raw_bytes: bytes) -> str:
-    decoded_text = from_bytes(raw_bytes).best().output_as_str if from_bytes(raw_bytes).best() else raw_bytes.decode("utf-8", errors="replace")
+    """Função de limpeza corrigida para a API moderna do charset-normalizer."""
+    try:
+        # Tenta detectar a melhor codificação
+        probe = from_bytes(raw_bytes).best()
+        if probe:
+            # A conversão direta do objeto probe para string é a forma correta
+            decoded_text = str(probe)
+        else:
+            # Fallback se a detecção falhar
+            decoded_text = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        # Fallback final para latin-1, comum em sistemas legados
+        decoded_text = raw_bytes.decode("latin-1", errors="replace")
+    
     fixed_text_content = fix_text(decoded_text)
     lines = fixed_text_content.strip().splitlines()
     if lines and "totalRegistros" in lines[-1]: lines.pop()
@@ -53,10 +68,7 @@ def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, pre
     
     with psycopg2.connect(conn_string) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            # >>> A CORREÇÃO FINAL E DECISIVA ESTÁ AQUI <<<
-            # Força o parâmetro a ser tratado como VARCHAR na comparação
             cur.execute("SELECT * FROM precos_catalogo WHERE codigo_item_catalogo = %s::VARCHAR", (codigo_item,))
-            
             precos_db_map = {f"{row['id_compra']}-{row['ni_fornecedor']}": row for row in cur}
 
             precos_para_inserir, precos_para_atualizar = [], []
@@ -97,9 +109,8 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
         try:
             async with session.get(base_url, params=params, headers={'accept': 'text/csv'}, timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as response:
                 if response.status == 429:
-                    logging.warning(f"Item {codigo_item}: Rate limit atingido na página {current_page}. Aguardando 5s para tentar novamente...")
-                    await asyncio.sleep(5)
-                    continue # Tenta a mesma página novamente
+                    logging.warning(f"Item {codigo_item}: Rate limit atingido. Aguardando 5s...")
+                    await asyncio.sleep(5); continue
                 if response.status != 200: break
                 
                 content_bytes = await response.read()
@@ -108,14 +119,14 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 cleaned_csv_text = _decode_and_clean_csv(content_bytes)
                 if len(cleaned_csv_text.strip().splitlines()) < 2: break
 
-                df_page = pd.read_csv(io.StringIO(cleaned_csv_text), sep=';', on_bad_lines='warn', engine='python', dtype=str) # dtype=str é crucial
+                df_page = pd.read_csv(io.StringIO(cleaned_csv_text), sep=';', on_bad_lines='warn', engine='python', dtype=str)
                 if df_page.empty: break
 
                 all_dfs.append(df_page)
                 current_page += 1
-                await asyncio.sleep(1) # Aumenta a pausa para ser mais gentil com a API
+                await asyncio.sleep(1)
         except Exception as e:
-            logging.error(f"Erro ao processar página {current_page} para item {codigo_item}: {e}", exc_info=True)
+            logging.error(f"Erro ao processar página {current_page} para item {codigo_item}: {e}", exc_info=False) # exc_info=False para não poluir o log
             break
     if not all_dfs: return []
     full_df = pd.concat(all_dfs, ignore_index=True)
@@ -134,16 +145,19 @@ async def process_itens_concorrently(conn_string: str, itens: List[Tuple[str, st
             try:
                 async with aiohttp.ClientSession() as session:
                     precos = await fetch_precos_item(session, codigo, tipo)
-                    if precos is not None:
+                    if precos:
                         try:
                             novos, atualizados = sync_precos_catalogo(conn_string, codigo, tipo, precos)
                             stats['precos_novos'] += novos; stats['precos_atualizados'] += atualizados; stats['itens_processados'] += 1
                             if novos > 0 or atualizados > 0: logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
                         except Exception as db_error:
                             logging.error(f"Erro de banco de dados para item {codigo}: {db_error}"); stats['erros'] += 1
-                    else: stats['erros'] += 1
+                    elif precos is None: # Erro na busca
+                        stats['erros'] += 1
+                    else: # Lista vazia, mas sucesso
+                        stats['itens_processados'] += 1
             except Exception as e:
-                logging.error(f"Erro crítico no fluxo do item {codigo}: {e}", exc_info=True); stats['erros'] += 1
+                logging.error(f"Erro crítico no fluxo do item {codigo}: {e}"); stats['erros'] += 1
     tasks = [fetch_and_sync(codigo, tipo) for codigo, tipo in itens]
     await asyncio.gather(*tasks)
     return stats
