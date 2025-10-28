@@ -1,4 +1,4 @@
-# Arquivo: atualizar_contratacoes.py (Versão com Arquivamento Inteligente por Status de Item)
+# Arquivo: atualizar_contratacoes.py (Versão com Controle de Rate Limit)
 
 import os
 import aiohttp
@@ -15,13 +15,16 @@ load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 API_BASE_URL = "https://dadosabertos.compras.gov.br/modulo-contratacoes"
-CONCURRENT_REQUESTS_LIMIT = 5
-TIMEOUT_API = aiohttp.ClientTimeout(total=60)
+
+# <<< AJUSTES DE RATE LIMIT >>>
+CONCURRENT_REQUESTS_LIMIT = 2  # Reduzido drasticamente para evitar 'Too Many Requests'
+DELAY_BETWEEN_TASKS = 0.1      # Pequeno atraso entre o início de cada tarefa de compra
+
+TIMEOUT_API = aiohttp.ClientTimeout(total=90) # Aumentado para 90s para dar mais folga
 
 ARQUIVO_ATIVAS = 'idCompra_ativas.txt'
 ARQUIVO_ARQUIVADAS = 'idCompra_arquivadas.txt'
 
-# <<< LISTA DE STATUS DE ITENS QUE INDICAM QUE O ITEM FOI RESOLVIDO >>>
 STATUS_ITEM_RESOLVIDO = ("homologado", "fracassado", "deserto", "anulado/revogado/cancelado")
 
 # --- Funções de Banco de Dados e API ---
@@ -39,20 +42,14 @@ def get_db_connection():
         return None
 
 def verificar_se_compra_esta_concluida_no_db(conn, id_compra):
-    """
-    Verifica no DB se TODOS os itens de uma compra têm um status considerado "resolvido".
-    Retorna True se a compra pode ser arquivada, False caso contrário.
-    """
     try:
         with conn.cursor() as cur:
-            # 1. Verifica se a compra existe e tem itens. Se não tiver itens, não podemos decidir.
             cur.execute("SELECT EXISTS (SELECT 1 FROM itens_compra WHERE id_compra = %s);", (id_compra,))
             tem_itens = cur.fetchone()[0]
             if not tem_itens:
                 logging.info(f"Compra {id_compra} é nova ou não tem itens no DB. Não será arquivada por enquanto.")
                 return False
 
-            # 2. Verifica se existe PELO MENOS UM item que NÃO TENHA um status resolvido.
             query = """
                 SELECT EXISTS (
                     SELECT 1 
@@ -64,12 +61,10 @@ def verificar_se_compra_esta_concluida_no_db(conn, id_compra):
             cur.execute(query, (id_compra, STATUS_ITEM_RESOLVIDO))
             tem_item_ativo = cur.fetchone()[0]
             
-            # Se existe um item ativo, a compra NÃO está concluída.
             if tem_item_ativo:
                 logging.info(f"Compra {id_compra} ainda tem itens ativos. Verificação de API necessária.")
                 return False
             else:
-                # Se NENHUM item ativo foi encontrado, significa que TODOS estão resolvidos.
                 logging.info(f"Todos os itens da compra {id_compra} estão resolvidos. Marcada para arquivamento.")
                 return True
                 
@@ -77,7 +72,7 @@ def verificar_se_compra_esta_concluida_no_db(conn, id_compra):
         logging.error(f"Erro de DB ao verificar status da compra {id_compra}: {e}. A compra não será arquivada por segurança.")
         return False
 
-# ... (As funções upsert_data, fetch_api_data_async, persistir_dados permanecem as mesmas da versão anterior)
+# ... (As funções upsert_data, fetch_api_data_async, persistir_dados permanecem as mesmas)
 def upsert_data(conn, table, columns, data, conflict_target, update_columns):
     if not data: return 0
     cols_str = ", ".join(columns)
@@ -100,6 +95,9 @@ async def fetch_api_data_async(session, endpoint, params):
     url = f"{API_BASE_URL}/{endpoint}"
     try:
         async with session.get(url, params=params, timeout=TIMEOUT_API) as response:
+            if response.status == 429:
+                logging.error(f"Erro 429 (Too Many Requests) para a URL: {response.url}. O servidor está sobrecarregado.")
+                return None # Retorna None para que a falha seja tratada
             response.raise_for_status()
             return await response.json(content_type=None)
     except asyncio.TimeoutError:
@@ -148,20 +146,15 @@ def persistir_dados(conn, compra_data, itens_data, resultados_data):
         upsert_data(conn, 'resultados_itens', res_cols, resultados_para_db, ['id_item_compra', 'sequencial_resultado'], [col for col in res_cols if col not in ['id_item_compra', 'sequencial_resultado']])
 
 async def processar_contratacao_ativa_async(session, semaphore, conn, id_compra):
-    """
-    Busca e persiste os dados de uma contratação que foi considerada ativa.
-    """
     async with semaphore:
         logging.info(f"Processando API para idCompra ativa: {id_compra}")
         params = {'tipo': 'idCompra', 'codigo': id_compra}
         
-        # Busca todos os dados em paralelo
         contratacao_task = fetch_api_data_async(session, "1.1_consultarContratacoes_PNCP_14133_Id", params)
         itens_task = fetch_api_data_async(session, "2.1_consultarItensContratacoes_PNCP_14133_Id", params)
         resultados_task = fetch_api_data_async(session, "3.1_consultarResultadoItensContratacoes_PNCP_14133_Id", params)
         contratacao_json, itens_json, resultados_json = await asyncio.gather(contratacao_task, itens_task, resultados_task)
         
-        # Validação dos dados recebidos
         if not contratacao_json or not contratacao_json.get('resultado'):
             logging.warning(f"Não foi possível obter dados da contratação principal para {id_compra}. A atualização falhou.")
             return
@@ -193,7 +186,6 @@ async def main_async():
 
         logging.info(f"Encontrados {len(id_compras_todas)} IDs de compra para verificação.")
         
-        # <<< NOVA LÓGICA DE SEPARAÇÃO >>>
         ids_para_arquivar = set()
         ids_para_processar_api = set()
 
@@ -203,21 +195,22 @@ async def main_async():
             else:
                 ids_para_processar_api.add(id_compra)
         
-        # Processa apenas as compras que ainda estão ativas
         if ids_para_processar_api:
             logging.info(f"Iniciando processamento de API para {len(ids_para_processar_api)} compras ativas.")
             semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS_LIMIT)
             async with aiohttp.ClientSession() as session:
-                tasks = [processar_contratacao_ativa_async(session, semaphore, conn, id_compra) for id_compra in ids_para_processar_api]
+                tasks = []
+                for id_compra in ids_para_processar_api:
+                    task = asyncio.create_task(processar_contratacao_ativa_async(session, semaphore, conn, id_compra))
+                    tasks.append(task)
+                    await asyncio.sleep(DELAY_BETWEEN_TASKS) # <<< Adiciona o atraso aqui
+                
                 await asyncio.gather(*tasks, return_exceptions=True)
         else:
             logging.info("Nenhuma compra ativa necessitando de atualização via API nesta execução.")
 
-        # Atualiza os arquivos de lista no final
         if ids_para_arquivar:
             logging.info(f"Arquivando {len(ids_para_arquivar)} IDs de compra concluídos.")
-            
-            # Garante que os IDs a serem arquivados não permaneçam na lista de ativos
             ids_ativos_final = id_compras_todas - ids_para_arquivar
             
             with open(ARQUIVO_ATIVAS, 'w') as f:
