@@ -5,7 +5,6 @@ import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
 import logging
-import json
 from datetime import datetime
 from typing import List, Tuple, Optional, Dict, Any
 import pandas as pd
@@ -21,7 +20,7 @@ load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 MAX_CONCURRENT_REQUESTS = 10
-TIMEOUT = 90 # Aumentado para downloads de CSV maiores
+TIMEOUT = 90
 
 # --- Funções Auxiliares ---
 
@@ -71,7 +70,7 @@ def sync_precos_catalogo(
     precos_api: List[Dict[str, Any]]
 ) -> Tuple[int, int]:
     """
-    Sincroniza os preços da API (já em formato de dicionário) com o banco.
+    Sincroniza os preços da API com o banco, com correção de tipo de dados.
     Retorna (novos_registros, registros_atualizados).
     """
     if not precos_api:
@@ -84,16 +83,17 @@ def sync_precos_catalogo(
             (codigo_item,)
         )
         for row in cur:
-            chave = f"{row['id_compra']}-{row['ni_fornecedor']}"
+            # Garante que as chaves sejam strings para comparação consistente
+            chave = f"{str(row['id_compra'])}-{str(row['ni_fornecedor'])}"
             precos_db_map[chave] = row
 
     precos_para_inserir = []
     precos_para_atualizar = []
 
     for p in precos_api:
-        # Usa os nomes de coluna normalizados
-        id_compra_api = p.get('numero_compra')
-        ni_fornecedor_api = p.get('cnpj_vencedor')
+        # Garante que os valores usados na chave sejam strings
+        id_compra_api = str(p.get('numero_compra', ''))
+        ni_fornecedor_api = str(p.get('cnpj_vencedor', ''))
 
         if not id_compra_api or not ni_fornecedor_api:
             continue
@@ -114,6 +114,7 @@ def sync_precos_catalogo(
                 precos_para_atualizar.append(p)
 
     with conn.cursor() as cur:
+        # Lote de Inserção
         if precos_para_inserir:
             insert_query = """
                 INSERT INTO precos_catalogo (
@@ -126,42 +127,36 @@ def sync_precos_catalogo(
                 (
                     codigo_item, tipo_item, p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'),
                     p.get('quantidade_item'), p.get('valor_unitario_homologado'), p.get('valor_total_homologado'),
-                    p.get('cnpj_vencedor'), p.get('nome_vencedor'), p.get('numero_compra'),
+                    str(p.get('cnpj_vencedor')), str(p.get('nome_vencedor')), str(p.get('numero_compra')),
                     p.get('data_resultado'), datetime.now()
                 ) for p in precos_para_inserir
             ]
             psycopg2.extras.execute_values(cur, insert_query, dados_insert)
 
+        # Lote de Atualização com execute_batch
         if precos_para_atualizar:
             update_query = """
                 UPDATE precos_catalogo SET
-                    descricao_item = data.descricao_item,
-                    unidade_medida = data.unidade_medida,
-                    quantidade_total = data.quantidade_total,
-                    valor_unitario = data.valor_unitario,
-                    valor_total = data.valor_total,
-                    nome_fornecedor = data.nome_fornecedor,
-                    data_compra = data.data_compra,
+                    descricao_item = %s,
+                    unidade_medida = %s,
+                    quantidade_total = %s,
+                    valor_unitario = %s,
+                    valor_total = %s,
+                    nome_fornecedor = %s,
+                    data_compra = %s,
                     data_atualizacao = CURRENT_TIMESTAMP
-                FROM (VALUES %s) AS data(
-                    id_compra, ni_fornecedor, descricao_item, unidade_medida,
-                    quantidade_total, valor_unitario, valor_total, nome_fornecedor, data_compra
-                )
-                WHERE precos_catalogo.id_compra = data.id_compra::varchar
-                  AND precos_catalogo.ni_fornecedor = data.ni_fornecedor::varchar
-                  AND precos_catalogo.codigo_item_catalogo = %s;
+                WHERE codigo_item_catalogo = %s AND id_compra = %s AND ni_fornecedor = %s;
             """
             dados_update = [
                 (
-                    p.get('numero_compra'), p.get('cnpj_vencedor'), p.get('descricao_item_catalogo'),
-                    p.get('unidade_fornecimento'), p.get('quantidade_item'), p.get('valor_unitario_homologado'),
-                    p.get('valor_total_homologado'), p.get('nome_vencedor'), p.get('data_resultado')
+                    p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'),
+                    p.get('quantidade_item'), p.get('valor_unitario_homologado'),
+                    p.get('valor_total_homologado'), str(p.get('nome_vencedor')),
+                    p.get('data_resultado'),
+                    codigo_item, str(p.get('numero_compra')), str(p.get('cnpj_vencedor'))
                 ) for p in precos_para_atualizar
             ]
-            # Mogrify é necessário para formatar a lista de valores e o parâmetro final corretamente
-            query_formatada = cur.mogrify(update_query, (psycopg2.extras.Json(dados_update), codigo_item)).decode('utf-8').replace("'", "")
-            cur.execute(query_formatada)
-
+            psycopg2.extras.execute_batch(cur, update_query, dados_update)
 
     conn.commit()
     return len(precos_para_inserir), len(precos_para_atualizar)
@@ -250,18 +245,27 @@ async def process_itens_concorrently(
                 async with aiohttp.ClientSession() as session:
                     precos = await fetch_precos_item(session, codigo, tipo)
                     if precos is not None:
-                        novos, atualizados = sync_precos_catalogo(conn, codigo, tipo, precos)
-                        stats['precos_novos'] += novos
-                        stats['precos_atualizados'] += atualizados
-                        stats['itens_processados'] += 1
-                        if novos > 0 or atualizados > 0:
-                            logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
+                        # Cada tarefa agora tem seu próprio cursor para evitar conflitos de transação
+                        with conn.cursor() as cur_task:
+                            try:
+                                novos, atualizados = sync_precos_catalogo(conn, codigo, tipo, precos)
+                                stats['precos_novos'] += novos
+                                stats['precos_atualizados'] += atualizados
+                                stats['itens_processados'] += 1
+                                if novos > 0 or atualizados > 0:
+                                    logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
+                                conn.commit() # Commit por tarefa bem-sucedida
+                            except Exception as db_error:
+                                logging.error(f"Erro de banco de dados para item {codigo}: {db_error}")
+                                conn.rollback() # Rollback em caso de erro na tarefa
+                                stats['erros'] += 1
                     else:
                         stats['erros'] += 1
             except Exception as e:
                 logging.error(f"Erro crítico no fluxo do item {codigo}: {e}", exc_info=True)
                 stats['erros'] += 1
 
+    # O código original já passava a conexão, mas a gestão de transação foi movida para dentro da tarefa
     tasks = [fetch_and_sync(codigo, tipo) for codigo, tipo in itens]
     await asyncio.gather(*tasks)
     return stats
@@ -294,5 +298,4 @@ async def main():
             logging.info("Conexão com o banco de dados fechada.")
 
 if __name__ == "__main__":
-    # Para rodar o loop de eventos do asyncio
     asyncio.run(main())
