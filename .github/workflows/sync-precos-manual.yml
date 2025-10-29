@@ -4,27 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       limite_itens:
-        description: 'Limite de itens (deixe vazio para TODOS)'
+        description: 'Limite de itens (vazio = TODOS)'
         required: false
+        type: string
         default: ''
       lote_size:
         description: 'Tamanho do lote'
         required: false
-        default: '5'
+        type: number
+        default: 5
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 horas
+    timeout-minutes: 360
     
     steps:
       - name: Checkout código
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       
       - name: Configurar Python 3.11
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
       
       - name: Instalar dependências
         run: |
@@ -40,27 +43,31 @@ jobs:
       
       - name: Executar sincronização
         env:
-          LIMITE_ITENS: ${{ github.event.inputs.limite_itens }}
-          LOTE_SIZE: ${{ github.event.inputs.lote_size }}
-        run: |
-          python atualizar_precos_catalogo.py
+          LIMITE_ITENS: ${{ inputs.limite_itens }}
+          LOTE_SIZE: ${{ inputs.lote_size }}
+        run: python atualizar_precos_catalogo.py
       
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: logs-sync
+          name: logs-sync-${{ github.run_number }}
           path: logs/*.log
           retention-days: 30
+          if-no-files-found: warn
       
       - name: Resumo da execução
         if: always()
         run: |
           echo "## Resumo da Sincronização" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run Number:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tamanho do Lote:** ${{ inputs.lote_size }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f logs/*.log ]; then
-            echo "### Últimas linhas do log:" >> $GITHUB_STEP_SUMMARY
+            echo "### Últimas 50 linhas do log:" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 50 logs/*.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Nenhum arquivo de log foi gerado." >> $GITHUB_STEP_SUMMARY
           fi
