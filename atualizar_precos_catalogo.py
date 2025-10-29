@@ -15,6 +15,8 @@ import random
 from pathlib import Path
 from charset_normalizer import from_bytes
 from ftfy import fix_text
+import subprocess
+import time
 
 # --- Configuração de Logs ---
 log_dir = Path("logs")
@@ -32,12 +34,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Configuração Cloudflare WARP ---
+def setup_cloudflare_warp():
+    """Configura e conecta ao Cloudflare WARP se disponível"""
+    use_warp = os.getenv('USE_CLOUDFLARE_WARP', 'false').lower() == 'true'
+    
+    if not use_warp:
+        logger.info("Cloudflare WARP desabilitado")
+        return False
+    
+    try:
+        logger.info("Verificando Cloudflare WARP...")
+        
+        # Verifica se warp-cli está instalado
+        result = subprocess.run(['which', 'warp-cli'], capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning("warp-cli não encontrado. Executando sem WARP.")
+            return False
+        
+        # Verifica status
+        logger.info("Verificando status do WARP...")
+        result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
+        
+        if 'Connected' not in result.stdout:
+            logger.info("Registrando WARP...")
+            subprocess.run(['warp-cli', 'register'], check=False)
+            
+            logger.info("Conectando ao WARP...")
+            subprocess.run(['warp-cli', 'connect'], check=True)
+            
+            # Aguardar conexão
+            for i in range(30):
+                time.sleep(1)
+                result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
+                if 'Connected' in result.stdout:
+                    logger.info("WARP conectado com sucesso!")
+                    break
+            else:
+                logger.warning("Timeout ao conectar WARP. Continuando sem WARP.")
+                return False
+        else:
+            logger.info("WARP já está conectado")
+        
+        # Verificar IP
+        try:
+            result = subprocess.run(['curl', '-s', 'https://api.ipify.org'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                logger.info(f"IP atual: {result.stdout.strip()}")
+        except Exception as e:
+            logger.warning(f"Não foi possível verificar IP: {e}")
+        
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Erro ao configurar WARP: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Erro inesperado ao configurar WARP: {e}")
+        return False
+
+def disconnect_cloudflare_warp():
+    """Desconecta do Cloudflare WARP"""
+    try:
+        result = subprocess.run(['which', 'warp-cli'], capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info("Desconectando WARP...")
+            subprocess.run(['warp-cli', 'disconnect'], check=False)
+            logger.info("WARP desconectado")
+    except Exception as e:
+        logger.warning(f"Erro ao desconectar WARP: {e}")
+
 # --- Carrega e Valida Variáveis de Ambiente ---
 print("\n" + "="*80)
 print("CARREGANDO CONFIGURAÇÕES")
 print("="*80)
 
-# Tenta carregar do arquivo dbconnection.env (execução local)
 env_path = Path('dbconnection.env')
 if env_path.exists():
     print(f"Arquivo dbconnection.env encontrado: {env_path.absolute()}")
@@ -45,7 +117,6 @@ if env_path.exists():
 else:
     print("Arquivo dbconnection.env não encontrado (modo GitHub Actions)")
 
-# Carrega CONN_STRING (pode vir do .env ou de variável de ambiente do GitHub)
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 
 if not CONN_STRING:
@@ -57,7 +128,6 @@ if not CONN_STRING:
     print("="*80 + "\n")
     exit(1)
 
-# Mostra informações da conexão (sem expor senha)
 if '@' in CONN_STRING:
     parts = CONN_STRING.split('@')
     host_info = parts[1] if len(parts) > 1 else 'não identificado'
@@ -69,7 +139,6 @@ else:
 print("="*80 + "\n")
 
 # --- Configurações ---
-# Permite configurar tamanho do lote via variável de ambiente (para GitHub Actions)
 LOTE_SIZE = int(os.getenv('LOTE_SIZE', '5'))
 TIMEOUT_LOTE = 300.0
 TIMEOUT_TOTAL = 120
@@ -550,83 +619,92 @@ async def main(limite_itens: Optional[int] = None):
     logger.info("Iniciando sincronização de preços do catálogo...")
     logger.info(f"Log salvo em: {log_filename}")
     
-    conn = get_db_connection()
-    if not conn:
-        logger.error("Não foi possível conectar ao banco. Encerrando.")
-        return
+    # Configurar Cloudflare WARP se habilitado
+    warp_connected = setup_cloudflare_warp()
     
     try:
-        itens_para_processar = get_itens_para_processar(conn, limite=limite_itens)
-    finally:
-        conn.close()
-
-    if not itens_para_processar:
-        logger.info("Nenhum item para processar.")
-        return
-
-    stats = {
-        'total_itens': len(itens_para_processar),
-        'itens_processados': 0,
-        'precos_novos': 0,
-        'erros': 0
-    }
-    
-    itens_lista = list(itens_para_processar.items())
-
-    connector = aiohttp.TCPConnector(
-        limit=10,
-        limit_per_host=5,
-        ttl_dns_cache=300,
-        enable_cleanup_closed=True,
-        force_close=False,
-        ssl=True
-    )
-    
-    timeout = aiohttp.ClientTimeout(
-        total=TIMEOUT_TOTAL,
-        connect=TIMEOUT_CONNECT,
-        sock_read=TIMEOUT_READ
-    )
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True) as session:
-        logger.info("\nINICIANDO PRIMEIRA PASSAGEM")
+        conn = get_db_connection()
+        if not conn:
+            logger.error("Não foi possível conectar ao banco. Encerrando.")
+            return
         
-        itens_falhados = await processar_e_salvar_lotes(session, itens_lista, stats)
+        try:
+            itens_para_processar = get_itens_para_processar(conn, limite=limite_itens)
+        finally:
+            conn.close()
 
-        if itens_falhados:
-            logger.info(f"\nINICIANDO RETENTATIVA PARA {len(itens_falhados)} ITENS")
-            stats['itens_processados'] = 0
-            itens_falhados_final = await processar_e_salvar_lotes(session, itens_falhados, stats)
+        if not itens_para_processar:
+            logger.info("Nenhum item para processar.")
+            return
+
+        stats = {
+            'total_itens': len(itens_para_processar),
+            'itens_processados': 0,
+            'precos_novos': 0,
+            'erros': 0
+        }
+        
+        itens_lista = list(itens_para_processar.items())
+
+        connector = aiohttp.TCPConnector(
+            limit=10,
+            limit_per_host=5,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            force_close=False,
+            ssl=True
+        )
+        
+        timeout = aiohttp.ClientTimeout(
+            total=TIMEOUT_TOTAL,
+            connect=TIMEOUT_CONNECT,
+            sock_read=TIMEOUT_READ
+        )
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True) as session:
+            logger.info("\nINICIANDO PRIMEIRA PASSAGEM")
             
-            if itens_falhados_final:
-                logger.error(f"\nITENS COM FALHA PERSISTENTE: {len(itens_falhados_final)}")
-                for codigo, _ in itens_falhados_final:
-                    logger.error(f"  Item {codigo}")
-                stats['erros'] += len(itens_falhados_final)
+            itens_falhados = await processar_e_salvar_lotes(session, itens_lista, stats)
 
-    logger.info(f"\n{'='*80}")
-    logger.info("RESUMO FINAL DA SINCRONIZACAO")
-    logger.info(f"{'='*80}")
-    logger.info(f"  Total de Itens: {stats['total_itens']}")
-    logger.info(f"  Itens Processados: {stats['itens_processados']}")
-    logger.info(f"  Preços Processados: {stats['precos_novos']}")
-    logger.info(f"  Erros: {stats['erros']}")
-    logger.info(f"{'='*80}")
-    logger.info(f"Log completo em: {log_filename}\n")
+            if itens_falhados:
+                logger.info(f"\nINICIANDO RETENTATIVA PARA {len(itens_falhados)} ITENS")
+                stats['itens_processados'] = 0
+                itens_falhados_final = await processar_e_salvar_lotes(session, itens_falhados, stats)
+                
+                if itens_falhados_final:
+                    logger.error(f"\nITENS COM FALHA PERSISTENTE: {len(itens_falhados_final)}")
+                    for codigo, _ in itens_falhados_final:
+                        logger.error(f"  Item {codigo}")
+                    stats['erros'] += len(itens_falhados_final)
+
+        logger.info(f"\n{'='*80}")
+        logger.info("RESUMO FINAL DA SINCRONIZACAO")
+        logger.info(f"{'='*80}")
+        logger.info(f"  Total de Itens: {stats['total_itens']}")
+        logger.info(f"  Itens Processados: {stats['itens_processados']}")
+        logger.info(f"  Preços Processados: {stats['precos_novos']}")
+        logger.info(f"  Erros: {stats['erros']}")
+        logger.info(f"{'='*80}")
+        logger.info(f"Log completo em: {log_filename}\n")
+        
+    finally:
+        # Desconectar WARP ao finalizar
+        if warp_connected:
+            disconnect_cloudflare_warp()
 
 if __name__ == "__main__":
-    # Permite configuração via variáveis de ambiente (para GitHub Actions)
     LIMITE_ITENS_ENV = os.getenv('LIMITE_ITENS')
     if LIMITE_ITENS_ENV:
         LIMITE_ITENS = int(LIMITE_ITENS_ENV) if LIMITE_ITENS_ENV.strip() else None
     else:
-        LIMITE_ITENS = None  # Processa todos os itens
+        LIMITE_ITENS = None
     
     print("\n" + "="*80)
     print("SINCRONIZACAO DE PRECOS DO CATALOGO")
     print("="*80)
     print(f"Limite de itens: {'TODOS' if LIMITE_ITENS is None else LIMITE_ITENS}")
     print(f"Tamanho do lote: {LOTE_SIZE}")
+    print(f"Cloudflare WARP: {'HABILITADO' if os.getenv('USE_CLOUDFLARE_WARP', 'false').lower() == 'true' else 'DESABILITADO'}")
     print("="*80 + "\n")
     
     asyncio.run(main(limite_itens=LIMITE_ITENS))
