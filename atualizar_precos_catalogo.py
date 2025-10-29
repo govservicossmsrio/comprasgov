@@ -395,7 +395,6 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         )
                         
                         # Verificar quantos foram realmente inseridos
-                        cur.execute("SELECT ROW_COUNT()")
                         rows_affected = cur.rowcount
                         total_novos += rows_affected
                         logging.info(f"Item {codigo_item}: {rows_affected} registros inseridos com sucesso")
@@ -671,4 +670,4 @@ async def processar_e_salvar_lotes(session: aiohttp.ClientSession, itens_para_pr
             # Filtrar apenas resultados válidos para sincronização
             resultados_validos = [res for res in resultados_coleta if res and res['sucesso'] and res['precos']]
             
-            logging.info(f"Lote {numero_lote}: {len(resultados
+            logging.info(f"Lote {numero_lote}: {len(resultados_validos)} itens com dados
