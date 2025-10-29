@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 import pandas as pd
 import io
 import re
+import random
 from charset_normalizer import from_bytes
 from ftfy import fix_text
 
@@ -29,8 +30,20 @@ load_dotenv(dotenv_path='dbconnection.env')
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 LOTE_SIZE = 5
 TIMEOUT_LOTE = 300.0  # 5 minutos
-TIMEOUT = 120
+TIMEOUT_TOTAL = 120  # Timeout total da requisição
+TIMEOUT_CONNECT = 30  # Timeout para estabelecer conexão
+TIMEOUT_READ = 90  # Timeout para ler dados
 MAX_RETRIES = 5
+
+# User-Agents para rotação
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+]
 
 # --- Funções Auxiliares ---
 
@@ -50,23 +63,19 @@ def gerar_id_item_compra(codigo_uasg: str, modalidade: str, id_contratacao: str,
     Exemplo: 986001 + 03 + 900012024 + 00001 = 9860010390001202400001
     """
     try:
-        # Remove espaços e caracteres não numéricos
         codigo_uasg = str(codigo_uasg).strip()
         modalidade = str(modalidade).strip()
         id_contratacao = str(id_contratacao).strip()
         numero_item = str(numero_item).strip()
         
-        # Valida se todos os campos estão presentes
         if not all([codigo_uasg, modalidade, id_contratacao, numero_item]):
             return None
         
-        # Formata cada componente
-        codigo_uasg_fmt = codigo_uasg.zfill(6)  # 6 dígitos
-        modalidade_fmt = modalidade.zfill(2)    # 2 dígitos
-        id_contratacao_fmt = id_contratacao.zfill(9)  # 9 dígitos
-        numero_item_fmt = numero_item.zfill(5)  # 5 dígitos
+        codigo_uasg_fmt = codigo_uasg.zfill(6)
+        modalidade_fmt = modalidade.zfill(2)
+        id_contratacao_fmt = id_contratacao.zfill(9)
+        numero_item_fmt = numero_item.zfill(5)
         
-        # Monta o ID completo
         id_item_compra = f"{codigo_uasg_fmt}{modalidade_fmt}{id_contratacao_fmt}{numero_item_fmt}"
         
         return id_item_compra
@@ -99,7 +108,6 @@ def converter_valor_brasileiro(valor_str: Any) -> Optional[Decimal]:
         if not valor_str:
             return None
         
-        # Remove pontos e substitui vírgula por ponto
         valor_str = valor_str.replace('.', '').replace(',', '.')
         
         return Decimal(valor_str)
@@ -176,15 +184,12 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                 erros_conversao = 0
                 erros_id_item = 0
                 
-                # Processa e valida todos os preços
                 for p in precos_api:
-                    # Extrai campos para gerar id_item_compra
                     codigo_uasg = p.get('codigo_uasg') or ''
                     modalidade = p.get('modalidade') or ''
                     id_compra_api = p.get('id_compra') or ''
                     numero_item_compra = p.get('numero_item_compra') or ''
                     
-                    # Gera o id_item_compra correto
                     id_item_compra = gerar_id_item_compra(
                         codigo_uasg,
                         modalidade,
@@ -194,11 +199,10 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     
                     if not id_item_compra:
                         erros_id_item += 1
-                        if erros_id_item <= 3:  # Log apenas os 3 primeiros
+                        if erros_id_item <= 3:
                             logger.warning(f"Item {codigo_item}: Não foi possível gerar id_item_compra. UASG={codigo_uasg}, Mod={modalidade}, ID={id_compra_api}, NumItem={numero_item_compra}")
                         continue
                     
-                    # Busca NI do fornecedor
                     ni_fornecedor_api = (
                         p.get('ni_fornecedor') or
                         p.get('cnpj_vencedor') or 
@@ -211,7 +215,6 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         precos_ignorados += 1
                         continue
                     
-                    # Busca e converte valor unitário
                     valor_unitario_str = (
                         p.get('preco_unitario') or
                         p.get('valor_unitario_homologado') or 
@@ -226,7 +229,6 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         erros_conversao += 1
                         continue
                     
-                    # Busca e converte outros campos
                     descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
                     
                     unidade = (
@@ -274,12 +276,11 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         valor_total,
                         ni_fornecedor_api,
                         nome_fornecedor,
-                        id_item_compra,  # AGORA USA O ID CORRETO
+                        id_item_compra,
                         data_resultado,
                         datetime.now()
                     ))
                 
-                # Log resumido
                 if precos_ignorados > 0:
                     logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados (NI fornecedor ausente)")
                 
@@ -291,18 +292,16 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                 
                 logger.info(f"Item {codigo_item}: {len(precos_validos)} preços válidos para processar")
                 
-                # UPSERT: Insere ou atualiza se já existir
                 if precos_validos:
                     logger.info(f"Executando UPSERT para {len(precos_validos)} preços do item {codigo_item}...")
                     
-                    # Usa execute_values com template personalizado para UPSERT
                     template = """
                         INSERT INTO precos_catalogo 
                         (codigo_item_catalogo, tipo_item, descricao_item, unidade_medida, 
                          quantidade_total, valor_unitario, valor_total, ni_fornecedor, 
-                         nome_fornecedor, id_compra, data_compra, data_atualizacao)
+                         nome_fornecedor, id_item_compra, data_compra, data_atualizacao)
                         VALUES %s
-                        ON CONFLICT (codigo_item_catalogo, id_compra, ni_fornecedor)
+                        ON CONFLICT (codigo_item_catalogo, id_item_compra, ni_fornecedor)
                         DO UPDATE SET
                             tipo_item = EXCLUDED.tipo_item,
                             descricao_item = EXCLUDED.descricao_item,
@@ -370,16 +369,39 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
 
     all_dfs, current_page, retries = [], 1, 0
     sucesso_coleta = True
+    connection_errors = 0
     
     while True:
         params['pagina'] = current_page
+        
+        # MELHORIA 1: Rotação de User-Agent
+        headers = {
+            'accept': 'text/csv',
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache',
+        }
+        
         try:
+            # MELHORIA 2: Timeout de conexão separado
+            timeout = aiohttp.ClientTimeout(
+                total=TIMEOUT_TOTAL,
+                connect=TIMEOUT_CONNECT,
+                sock_read=TIMEOUT_READ
+            )
+            
             async with session.get(
                 base_url,
                 params=params,
-                headers={'accept': 'text/csv'},
-                timeout=aiohttp.ClientTimeout(total=TIMEOUT)
+                headers=headers,
+                timeout=timeout,
+                ssl=True
             ) as response:
+                
+                # Reset contador de erros de conexão em caso de sucesso
+                connection_errors = 0
                 
                 if response.status == 429:
                     if retries < MAX_RETRIES:
@@ -393,7 +415,20 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                         sucesso_coleta = False
                         break
                 
+                if response.status == 503:
+                    if retries < MAX_RETRIES:
+                        wait_time = 10 * (2 ** retries)
+                        logger.warning(f"Item {codigo_item}: Serviço indisponível (503) na página {current_page}. Aguardando {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        retries += 1
+                        continue
+                    else:
+                        logger.error(f"Item {codigo_item}: Serviço indisponível após {MAX_RETRIES} tentativas.")
+                        sucesso_coleta = False
+                        break
+                
                 if response.status != 200:
+                    logger.warning(f"Item {codigo_item}: Status {response.status} na página {current_page}")
                     break
                 
                 retries = 0
@@ -420,10 +455,27 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 
                 all_dfs.append(df_page)
                 current_page += 1
-                await asyncio.sleep(0.5)
                 
+                # MELHORIA 4: Delay aleatório entre requisições
+                delay = random.uniform(0.5, 1.5)
+                await asyncio.sleep(delay)
+        
+        # MELHORIA 3: Retry específico para erros de conexão
+        except (aiohttp.ClientError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
+            connection_errors += 1
+            
+            if connection_errors <= MAX_RETRIES:
+                wait_time = 5 * (2 ** connection_errors)
+                logger.warning(f"Item {codigo_item}: Erro de conexão ({type(e).__name__}) na página {current_page}. Tentativa {connection_errors}/{MAX_RETRIES}. Aguardando {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"Item {codigo_item}: Falha de conexão após {MAX_RETRIES} tentativas: {e}")
+                sucesso_coleta = False
+                break
+        
         except Exception as e:
-            logger.error(f"Erro de rede/processamento para item {codigo_item}: {e}", exc_info=False)
+            logger.error(f"Erro inesperado para item {codigo_item}: {type(e).__name__} - {e}", exc_info=False)
             sucesso_coleta = False
             break
     
@@ -537,7 +589,27 @@ async def main():
     
     itens_lista = list(itens_para_processar.items())
 
-    async with aiohttp.ClientSession() as session:
+    # Configuração otimizada do connector
+    connector = aiohttp.TCPConnector(
+        limit=10,  # Máximo de conexões simultâneas
+        limit_per_host=5,  # Máximo por host
+        ttl_dns_cache=300,  # Cache DNS por 5 minutos
+        enable_cleanup_closed=True,
+        force_close=False,  # Reutiliza conexões
+        ssl=True
+    )
+    
+    timeout = aiohttp.ClientTimeout(
+        total=TIMEOUT_TOTAL,
+        connect=TIMEOUT_CONNECT,
+        sock_read=TIMEOUT_READ
+    )
+
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        trust_env=True
+    ) as session:
         logger.info(f"\n{'='*60}")
         logger.info("INICIANDO PRIMEIRA PASSAGEM")
         logger.info(f"{'='*60}\n")
