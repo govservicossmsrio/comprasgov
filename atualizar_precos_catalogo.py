@@ -37,28 +37,27 @@ print("\n" + "="*80)
 print("CARREGANDO CONFIGURAÇÕES")
 print("="*80)
 
+# Tenta carregar do arquivo dbconnection.env (execução local)
 env_path = Path('dbconnection.env')
-if not env_path.exists():
-    print(f"ERRO: Arquivo dbconnection.env não encontrado em: {env_path.absolute()}")
-    print("\nCrie o arquivo dbconnection.env com o seguinte conteúdo:")
-    print("COCKROACHDB_CONN_STRING=postgresql://usuario:senha@host:26257/database?sslmode=verify-full")
-    print("="*80 + "\n")
-    exit(1)
+if env_path.exists():
+    print(f"Arquivo dbconnection.env encontrado: {env_path.absolute()}")
+    load_dotenv(dotenv_path='dbconnection.env')
+else:
+    print("Arquivo dbconnection.env não encontrado (modo GitHub Actions)")
 
-print(f"Arquivo dbconnection.env encontrado: {env_path.absolute()}")
-
-load_dotenv(dotenv_path='dbconnection.env')
-
+# Carrega CONN_STRING (pode vir do .env ou de variável de ambiente do GitHub)
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 
 if not CONN_STRING:
-    print("\nERRO: Variável COCKROACHDB_CONN_STRING não encontrada no arquivo dbconnection.env")
-    print("\nVerifique se o arquivo dbconnection.env contém:")
-    print("COCKROACHDB_CONN_STRING=postgresql://...")
-    print("\nNOTA: Não deve haver espaços antes ou depois do '='")
+    print("\nERRO: Variável COCKROACHDB_CONN_STRING não encontrada")
+    print("\nPara execução local:")
+    print("  - Crie o arquivo dbconnection.env com: COCKROACHDB_CONN_STRING=postgresql://...")
+    print("\nPara GitHub Actions:")
+    print("  - Configure o secret COCKROACHDB_CONN_STRING no repositório")
     print("="*80 + "\n")
     exit(1)
 
+# Mostra informações da conexão (sem expor senha)
 if '@' in CONN_STRING:
     parts = CONN_STRING.split('@')
     host_info = parts[1] if len(parts) > 1 else 'não identificado'
@@ -165,7 +164,7 @@ def get_db_connection():
     except psycopg2.OperationalError as e:
         logger.error(f"Falha ao conectar ao banco: {e}")
         logger.error("\nVerifique:")
-        logger.error("1. A string de conexão está correta no arquivo dbconnection.env")
+        logger.error("1. A string de conexão está correta")
         logger.error("2. O cluster CockroachDB está ativo")
         logger.error("3. Você tem acesso à internet")
         logger.error("4. As credenciais (usuário/senha) estão corretas")
