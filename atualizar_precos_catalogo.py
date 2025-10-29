@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import logging
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Dict, Any
+from decimal import Decimal, InvalidOperation
 import pandas as pd
 import io
 import re
@@ -41,29 +42,68 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
 
-def converter_valor_brasileiro(valor_str: Any) -> Optional[float]:
+def gerar_id_item_compra(codigo_uasg: str, modalidade: str, id_contratacao: str, numero_item: str) -> Optional[str]:
     """
-    Converte valores no formato brasileiro (162.800,00) para float.
-    Retorna None se a conversão falhar.
+    Gera o ID do item de compra no formato:
+    unidade_uasg_codigo (6 dígitos) + modalidade (2 dígitos) + id_contratacao (9 dígitos) + numero_item (5 dígitos)
+    
+    Exemplo: 986001 + 03 + 900012024 + 00001 = 9860010390001202400001
+    """
+    try:
+        # Remove espaços e caracteres não numéricos
+        codigo_uasg = str(codigo_uasg).strip()
+        modalidade = str(modalidade).strip()
+        id_contratacao = str(id_contratacao).strip()
+        numero_item = str(numero_item).strip()
+        
+        # Valida se todos os campos estão presentes
+        if not all([codigo_uasg, modalidade, id_contratacao, numero_item]):
+            return None
+        
+        # Formata cada componente
+        codigo_uasg_fmt = codigo_uasg.zfill(6)  # 6 dígitos
+        modalidade_fmt = modalidade.zfill(2)    # 2 dígitos
+        id_contratacao_fmt = id_contratacao.zfill(9)  # 9 dígitos
+        numero_item_fmt = numero_item.zfill(5)  # 5 dígitos
+        
+        # Monta o ID completo
+        id_item_compra = f"{codigo_uasg_fmt}{modalidade_fmt}{id_contratacao_fmt}{numero_item_fmt}"
+        
+        return id_item_compra
+    except (ValueError, AttributeError):
+        return None
+
+def converter_valor_brasileiro(valor_str: Any) -> Optional[Decimal]:
+    """
+    Converte valores no formato brasileiro (162.800,5477) para Decimal.
+    Preserva precisão exata de casas decimais.
     """
     if valor_str is None:
         return None
     
+    if isinstance(valor_str, Decimal):
+        return valor_str
+    
     if isinstance(valor_str, (int, float)):
-        return float(valor_str)
+        try:
+            return Decimal(str(valor_str))
+        except InvalidOperation:
+            return None
     
     if not isinstance(valor_str, str):
         valor_str = str(valor_str)
     
     try:
-        # Remove espaços em branco
         valor_str = valor_str.strip()
         
-        # Remove pontos (separador de milhar) e substitui vírgula por ponto
+        if not valor_str:
+            return None
+        
+        # Remove pontos e substitui vírgula por ponto
         valor_str = valor_str.replace('.', '').replace(',', '.')
         
-        return float(valor_str)
-    except (ValueError, AttributeError):
+        return Decimal(valor_str)
+    except (ValueError, InvalidOperation, AttributeError):
         return None
 
 def _decode_and_clean_csv(raw_bytes: bytes) -> str:
@@ -128,35 +168,37 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                 continue
 
             logger.info(f"Processando item {codigo_item} com {len(precos_api)} preços da API...")
-            
-            # DEBUG: Mostra as colunas do primeiro registro apenas
-            if precos_api:
-                colunas = list(precos_api[0].keys())
-                logger.info(f"DEBUG - Total de colunas: {len(colunas)}, Primeiras 10: {colunas[:10]}")
 
             conn = psycopg2.connect(conn_string)
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # Busca preços existentes no banco
-                cur.execute("SELECT * FROM precos_catalogo WHERE codigo_item_catalogo = %s::VARCHAR", (codigo_item,))
-                precos_db = cur.fetchall()
-                precos_db_map = {f"{row['id_compra']}-{row['ni_fornecedor']}": row for row in precos_db}
-                
-                logger.info(f"Item {codigo_item}: {len(precos_db_map)} preços existentes no banco")
-                
-                precos_para_inserir, precos_para_atualizar = [], []
+                precos_validos = []
                 precos_ignorados = 0
                 erros_conversao = 0
+                erros_id_item = 0
                 
+                # Processa e valida todos os preços
                 for p in precos_api:
-                    # Busca campos obrigatórios
-                    id_compra_api = (
-                        p.get('id_compra') or 
-                        p.get('numero_compra') or 
-                        p.get('numero_da_compra') or 
-                        p.get('compra') or
-                        ''
+                    # Extrai campos para gerar id_item_compra
+                    codigo_uasg = p.get('codigo_uasg') or ''
+                    modalidade = p.get('modalidade') or ''
+                    id_compra_api = p.get('id_compra') or ''
+                    numero_item_compra = p.get('numero_item_compra') or ''
+                    
+                    # Gera o id_item_compra correto
+                    id_item_compra = gerar_id_item_compra(
+                        codigo_uasg,
+                        modalidade,
+                        id_compra_api,
+                        numero_item_compra
                     )
                     
+                    if not id_item_compra:
+                        erros_id_item += 1
+                        if erros_id_item <= 3:  # Log apenas os 3 primeiros
+                            logger.warning(f"Item {codigo_item}: Não foi possível gerar id_item_compra. UASG={codigo_uasg}, Mod={modalidade}, ID={id_compra_api}, NumItem={numero_item_compra}")
+                        continue
+                    
+                    # Busca NI do fornecedor
                     ni_fornecedor_api = (
                         p.get('ni_fornecedor') or
                         p.get('cnpj_vencedor') or 
@@ -165,13 +207,11 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         ''
                     )
                     
-                    if not id_compra_api or not ni_fornecedor_api:
+                    if not ni_fornecedor_api:
                         precos_ignorados += 1
                         continue
                     
-                    chave_api = f"{id_compra_api}-{ni_fornecedor_api}"
-                    
-                    # Busca valor unitário
+                    # Busca e converte valor unitário
                     valor_unitario_str = (
                         p.get('preco_unitario') or
                         p.get('valor_unitario_homologado') or 
@@ -180,240 +220,110 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         None
                     )
                     
-                    # Converte valor brasileiro para float
-                    valor_unitario_api = converter_valor_brasileiro(valor_unitario_str)
+                    valor_unitario = converter_valor_brasileiro(valor_unitario_str)
                     
-                    if valor_unitario_api is None:
+                    if valor_unitario is None:
                         erros_conversao += 1
                         continue
                     
-                    preco_existente = precos_db_map.get(chave_api)
+                    # Busca e converte outros campos
+                    descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
                     
-                    if not preco_existente:
-                        precos_para_inserir.append(p)
-                    else:
+                    unidade = (
+                        p.get('sigla_unidade_medida') or
+                        p.get('nome_unidade_medida') or
+                        p.get('unidade_fornecimento') or 
+                        p.get('unidade_medida') or 
+                        p.get('unidade') or
+                        None
+                    )
+                    
+                    quantidade_str = p.get('quantidade') or p.get('quantidade_item') or None
+                    quantidade = converter_valor_brasileiro(quantidade_str)
+                    
+                    valor_total_str = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
+                    valor_total = converter_valor_brasileiro(valor_total_str)
+                    
+                    if valor_total is None and valor_unitario is not None and quantidade is not None:
                         try:
-                            valor_db = float(preco_existente['valor_unitario']) if preco_existente['valor_unitario'] is not None else 0.0
-                            
-                            if abs(valor_unitario_api - valor_db) > 0.01:
-                                precos_para_atualizar.append(p)
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"Erro ao comparar valores para {chave_api}: {e}")
-                            continue
+                            valor_total = valor_unitario * quantidade
+                        except (ValueError, TypeError, InvalidOperation):
+                            valor_total = None
+                    
+                    nome_fornecedor = (
+                        p.get('nome_fornecedor') or
+                        p.get('nome_vencedor') or 
+                        p.get('fornecedor') or
+                        None
+                    )
+                    
+                    data_resultado = (
+                        p.get('data_resultado') or
+                        p.get('data_compra') or 
+                        p.get('data') or
+                        None
+                    )
+                    
+                    precos_validos.append((
+                        codigo_item,
+                        tipo_item,
+                        descricao,
+                        unidade,
+                        quantidade,
+                        valor_unitario,
+                        valor_total,
+                        ni_fornecedor_api,
+                        nome_fornecedor,
+                        id_item_compra,  # AGORA USA O ID CORRETO
+                        data_resultado,
+                        datetime.now()
+                    ))
                 
-                # Log resumido de erros
+                # Log resumido
                 if precos_ignorados > 0:
-                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados (campos obrigatórios ausentes)")
+                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados (NI fornecedor ausente)")
                 
                 if erros_conversao > 0:
                     logger.warning(f"Item {codigo_item}: {erros_conversao} preços com erro de conversão de valor")
                 
-                logger.info(f"Item {codigo_item}: {len(precos_para_inserir)} para inserir, {len(precos_para_atualizar)} para atualizar")
+                if erros_id_item > 0:
+                    logger.warning(f"Item {codigo_item}: {erros_id_item} preços sem id_item_compra válido")
                 
-                # Inserções
-                if precos_para_inserir:
-                    logger.info(f"Inserindo {len(precos_para_inserir)} novos preços para item {codigo_item}...")
+                logger.info(f"Item {codigo_item}: {len(precos_validos)} preços válidos para processar")
+                
+                # UPSERT: Insere ou atualiza se já existir
+                if precos_validos:
+                    logger.info(f"Executando UPSERT para {len(precos_validos)} preços do item {codigo_item}...")
                     
-                    dados_insert = []
-                    for p in precos_para_inserir:
-                        # Busca e converte campos
-                        descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
-                        
-                        unidade = (
-                            p.get('sigla_unidade_medida') or
-                            p.get('nome_unidade_medida') or
-                            p.get('unidade_fornecimento') or 
-                            p.get('unidade_medida') or 
-                            p.get('unidade') or
-                            None
-                        )
-                        
-                        # CORREÇÃO CRÍTICA: Converte quantidade para float
-                        quantidade_str = p.get('quantidade') or p.get('quantidade_item') or None
-                        quantidade = converter_valor_brasileiro(quantidade_str)
-                        
-                        # Converte valor unitário
-                        valor_unitario_str = (
-                            p.get('preco_unitario') or
-                            p.get('valor_unitario_homologado') or 
-                            p.get('valor_unitario') or 
-                            p.get('valor') or
-                            None
-                        )
-                        valor_unitario = converter_valor_brasileiro(valor_unitario_str)
-                        
-                        # Calcula ou converte valor total
-                        valor_total_str = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
-                        valor_total = converter_valor_brasileiro(valor_total_str)
-                        
-                        # Se não tem valor total mas tem unitário e quantidade, calcula
-                        if valor_total is None and valor_unitario is not None and quantidade is not None:
-                            try:
-                                valor_total = valor_unitario * quantidade
-                            except (ValueError, TypeError):
-                                valor_total = None
-                        
-                        cnpj = (
-                            p.get('ni_fornecedor') or
-                            p.get('cnpj_vencedor') or 
-                            p.get('cnpj_fornecedor') or 
-                            p.get('cnpj') or
-                            None
-                        )
-                        
-                        nome_fornecedor = (
-                            p.get('nome_fornecedor') or
-                            p.get('nome_vencedor') or 
-                            p.get('fornecedor') or
-                            None
-                        )
-                        
-                        numero_compra = (
-                            p.get('id_compra') or
-                            p.get('numero_compra') or 
-                            p.get('numero_da_compra') or 
-                            p.get('compra') or
-                            None
-                        )
-                        
-                        data_resultado = (
-                            p.get('data_resultado') or
-                            p.get('data_compra') or 
-                            p.get('data') or
-                            None
-                        )
-                        
-                        dados_insert.append((
-                            codigo_item,
-                            tipo_item,
-                            descricao,
-                            unidade,
-                            quantidade,  # Agora é float ou None
-                            valor_unitario,  # Já é float ou None
-                            valor_total,  # Já é float ou None
-                            cnpj,
-                            nome_fornecedor,
-                            numero_compra,
-                            data_resultado,
-                            datetime.now()
-                        ))
+                    # Usa execute_values com template personalizado para UPSERT
+                    template = """
+                        INSERT INTO precos_catalogo 
+                        (codigo_item_catalogo, tipo_item, descricao_item, unidade_medida, 
+                         quantidade_total, valor_unitario, valor_total, ni_fornecedor, 
+                         nome_fornecedor, id_compra, data_compra, data_atualizacao)
+                        VALUES %s
+                        ON CONFLICT (codigo_item_catalogo, id_compra, ni_fornecedor)
+                        DO UPDATE SET
+                            tipo_item = EXCLUDED.tipo_item,
+                            descricao_item = EXCLUDED.descricao_item,
+                            unidade_medida = EXCLUDED.unidade_medida,
+                            quantidade_total = EXCLUDED.quantidade_total,
+                            valor_unitario = EXCLUDED.valor_unitario,
+                            valor_total = EXCLUDED.valor_total,
+                            nome_fornecedor = EXCLUDED.nome_fornecedor,
+                            data_compra = EXCLUDED.data_compra,
+                            data_atualizacao = EXCLUDED.data_atualizacao
+                    """
                     
                     psycopg2.extras.execute_values(
                         cur,
-                        """INSERT INTO precos_catalogo 
-                           (codigo_item_catalogo, tipo_item, descricao_item, unidade_medida, 
-                            quantidade_total, valor_unitario, valor_total, ni_fornecedor, 
-                            nome_fornecedor, id_compra, data_compra, data_atualizacao) 
-                           VALUES %s""",
-                        dados_insert
-                    )
-                    total_novos += len(dados_insert)
-                    logger.info(f"Item {codigo_item}: {len(dados_insert)} novos preços inseridos com sucesso!")
-
-                # Atualizações
-                if precos_para_atualizar:
-                    logger.info(f"Atualizando {len(precos_para_atualizar)} preços para item {codigo_item}...")
-                    
-                    dados_update = []
-                    for p in precos_para_atualizar:
-                        descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
-                        
-                        unidade = (
-                            p.get('sigla_unidade_medida') or
-                            p.get('nome_unidade_medida') or
-                            p.get('unidade_fornecimento') or 
-                            p.get('unidade_medida') or 
-                            p.get('unidade') or
-                            None
-                        )
-                        
-                        # CORREÇÃO CRÍTICA: Converte quantidade
-                        quantidade_str = p.get('quantidade') or p.get('quantidade_item') or None
-                        quantidade = converter_valor_brasileiro(quantidade_str)
-                        
-                        # Converte valor unitário
-                        valor_unitario_str = (
-                            p.get('preco_unitario') or
-                            p.get('valor_unitario_homologado') or 
-                            p.get('valor_unitario') or 
-                            p.get('valor') or
-                            None
-                        )
-                        valor_unitario = converter_valor_brasileiro(valor_unitario_str)
-                        
-                        # Converte valor total
-                        valor_total_str = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
-                        valor_total = converter_valor_brasileiro(valor_total_str)
-                        
-                        if valor_total is None and valor_unitario is not None and quantidade is not None:
-                            try:
-                                valor_total = valor_unitario * quantidade
-                            except (ValueError, TypeError):
-                                valor_total = None
-                        
-                        nome_fornecedor = (
-                            p.get('nome_fornecedor') or
-                            p.get('nome_vencedor') or 
-                            p.get('fornecedor') or
-                            None
-                        )
-                        
-                        data_resultado = (
-                            p.get('data_resultado') or
-                            p.get('data_compra') or 
-                            p.get('data') or
-                            None
-                        )
-                        
-                        numero_compra = (
-                            p.get('id_compra') or
-                            p.get('numero_compra') or 
-                            p.get('numero_da_compra') or 
-                            p.get('compra') or
-                            None
-                        )
-                        
-                        cnpj = (
-                            p.get('ni_fornecedor') or
-                            p.get('cnpj_vencedor') or 
-                            p.get('cnpj_fornecedor') or 
-                            p.get('cnpj') or
-                            None
-                        )
-                        
-                        dados_update.append((
-                            descricao,
-                            unidade,
-                            quantidade,  # Agora é float ou None
-                            valor_unitario,  # Já é float ou None
-                            valor_total,  # Já é float ou None
-                            nome_fornecedor,
-                            data_resultado,
-                            codigo_item,
-                            numero_compra,
-                            cnpj
-                        ))
-                    
-                    psycopg2.extras.execute_batch(
-                        cur,
-                        """UPDATE precos_catalogo 
-                           SET descricao_item = %s, 
-                               unidade_medida = %s, 
-                               quantidade_total = %s, 
-                               valor_unitario = %s, 
-                               valor_total = %s, 
-                               nome_fornecedor = %s, 
-                               data_compra = %s, 
-                               data_atualizacao = CURRENT_TIMESTAMP 
-                           WHERE codigo_item_catalogo = %s 
-                             AND id_compra = %s 
-                             AND ni_fornecedor = %s""",
-                        dados_update
+                        template,
+                        precos_validos,
+                        page_size=1000
                     )
                     
-                    linhas_atualizadas = cur.rowcount
-                    total_atualizados += linhas_atualizadas
-                    logger.info(f"Item {codigo_item}: {linhas_atualizadas} linhas atualizadas com sucesso!")
+                    total_novos += len(precos_validos)
+                    logger.info(f"Item {codigo_item}: {len(precos_validos)} preços processados com sucesso!")
             
             conn.commit()
             logger.info(f"Item {codigo_item}: Transação commitada com sucesso")
@@ -428,8 +338,8 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
             if conn:
                 conn.close()
     
-    if total_novos > 0 or total_atualizados > 0:
-        logger.info(f"LOTE COMPLETO: {total_novos} novos, {total_atualizados} atualizados")
+    if total_novos > 0:
+        logger.info(f"LOTE COMPLETO: {total_novos} preços processados")
     else:
         logger.info(f"LOTE COMPLETO: Nenhuma alteração necessária no banco")
             
@@ -479,7 +389,7 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                         retries += 1
                         continue
                     else:
-                        logger.error(f"Item {codigo_item}: Rate limit excedido após {MAX_RETRIES} tentativas. Desistindo deste item.")
+                        logger.error(f"Item {codigo_item}: Rate limit excedido após {MAX_RETRIES} tentativas.")
                         sucesso_coleta = False
                         break
                 
@@ -591,6 +501,7 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
             
             logger.info(f"\n{'='*60}")
             logger.info(f"LOTE {lote_num}/{total_lotes} CONCLUIDO")
+            logger.info(f"   Processados: {novos} | Erros: {erros_db}")
             logger.info(f"{'='*60}\n")
         else:
             logger.warning(f"Nenhum resultado válido para salvar no lote {lote_num}/{total_lotes}")
@@ -654,8 +565,7 @@ async def main():
     logger.info(f"{'='*80}")
     logger.info(f"  Total de Itens: {stats['total_itens']}")
     logger.info(f"  Itens Processados: {stats['itens_processados']}")
-    logger.info(f"  Preços Novos: {stats['precos_novos']}")
-    logger.info(f"  Preços Atualizados: {stats['precos_atualizados']}")
+    logger.info(f"  Preços Processados: {stats['precos_novos']}")
     logger.info(f"  Erros: {stats['erros']}")
     logger.info(f"{'='*80}\n")
 
