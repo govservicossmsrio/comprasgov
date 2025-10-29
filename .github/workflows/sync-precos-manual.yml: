@@ -1,0 +1,66 @@
+name: Sync Preços Manual
+
+on:
+  workflow_dispatch:
+    inputs:
+      limite_itens:
+        description: 'Limite de itens (deixe vazio para TODOS)'
+        required: false
+        default: ''
+      lote_size:
+        description: 'Tamanho do lote'
+        required: false
+        default: '5'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 horas
+    
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v3
+      
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          pip install aiohttp==3.9.1 psycopg2-binary==2.9.9 python-dotenv==1.0.0 pandas==2.1.4 charset-normalizer==3.3.2 ftfy==6.1.3
+      
+      - name: Criar arquivo de conexão
+        run: |
+          echo "COCKROACHDB_CONN_STRING=${{ secrets.COCKROACHDB_CONN_STRING }}" > dbconnection.env
+      
+      - name: Criar pasta de logs
+        run: mkdir -p logs
+      
+      - name: Executar sincronização
+        env:
+          LIMITE_ITENS: ${{ github.event.inputs.limite_itens }}
+          LOTE_SIZE: ${{ github.event.inputs.lote_size }}
+        run: |
+          python atualizar_precos_catalogo.py
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: logs-sync
+          path: logs/*.log
+          retention-days: 30
+      
+      - name: Resumo da execução
+        if: always()
+        run: |
+          echo "## Resumo da Sincronização" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f logs/*.log ]; then
+            echo "### Últimas linhas do log:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 logs/*.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
