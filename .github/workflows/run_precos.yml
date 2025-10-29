@@ -5,38 +5,16 @@ name: Atualizar Banco de Dados - Preços de Catálogo
 on:
   # Permite acionar manualmente pela interface do GitHub
   workflow_dispatch:
-    inputs:
-      limite_itens:
-        description: 'Limite de itens (vazio = TODOS)'
-        required: false
-        type: string
-        default: ''
-      lote_size:
-        description: 'Tamanho do lote'
-        required: false
-        type: number
-        default: 5
-      use_warp:
-        description: 'Usar Cloudflare WARP para trocar IP'
-        required: false
-        type: boolean
-        default: true
 
-  # Aciona automaticamente 3 vezes por dia (horário de Brasília)
+  # Aciona automaticamente em um agendamento (schedule)
   schedule:
-    # 6h00 Brasília = 9h00 UTC
-    - cron: '0 9 * * *'
-    # 13h00 Brasília = 16h00 UTC
-    - cron: '0 16 * * *'
-    # 18h00 Brasília = 21h00 UTC
-    - cron: '0 21 * * *'
+    # Roda uma vez por dia, à 1 da manhã (UTC)
+    - cron: '0 1 * * *'
 
 jobs:
   # Nome do Job
   atualizar-precos:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
-    
     steps:
       - name: 1. Checkout do código do repositório
         uses: actions/checkout@v4
@@ -45,139 +23,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
+          cache: 'pip' # Adiciona cache para acelerar a instalação de dependências
 
       - name: 3. Instalar dependências Python
         run: pip install -r requirements.txt
 
-      - name: 4. Criar pasta de logs
-        run: mkdir -p logs
-
-      - name: 5. Verificar IP original
-        run: |
-          echo "=========================================="
-          echo "IP ORIGINAL DO GITHUB ACTIONS:"
-          curl -s https://api.ipify.org
-          echo ""
-          echo "=========================================="
-
-      - name: 6. Instalar Cloudflare WARP (se necessário)
-        run: |
-          echo "=========================================="
-          echo "INSTALANDO CLOUDFLARE WARP"
-          echo "=========================================="
-          
-          # Adicionar repositório Cloudflare
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          
-          # Instalar WARP
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
-          
-          echo "WARP instalado com sucesso!"
-          echo "=========================================="
-
-      - name: 7. Conectar ao Cloudflare WARP
-        run: |
-          echo "=========================================="
-          echo "CONECTANDO AO CLOUDFLARE WARP"
-          echo "=========================================="
-          
-          # Registrar o cliente WARP (comando correto)
-          warp-cli --accept-tos registration new
-          
-          # Conectar ao WARP
-          warp-cli --accept-tos connect
-          
-          # Aguardar conexão estabelecer
-          echo "Aguardando conexão WARP..."
-          sleep 15
-          
-          # Verificar status
-          warp-cli status
-          
-          echo "=========================================="
-
-      - name: 8. Verificar novo IP (com WARP)
-        run: |
-          echo "=========================================="
-          echo "NOVO IP COM CLOUDFLARE WARP:"
-          curl -s https://api.ipify.org
-          echo ""
-          echo "Informações adicionais:"
-          curl -s https://www.cloudflare.com/cdn-cgi/trace
-          echo "=========================================="
-
-      - name: 9. Executar script de atualização de preços
+      - name: 4. Executar script de atualização de preços
+        # Define a variável de ambiente a partir do GitHub Secret
         env:
           COCKROACHDB_CONN_STRING: ${{ secrets.COCKROACHDB_CONN_STRING }}
-          LIMITE_ITENS: ${{ inputs.limite_itens }}
-          LOTE_SIZE: ${{ inputs.lote_size }}
-        run: |
-          echo "=========================================="
-          echo "INICIANDO SCRIPT PYTHON"
-          echo "=========================================="
-          echo "Cloudflare WARP: $USE_CLOUDFLARE_WARP"
-          echo "Limite de itens: ${LIMITE_ITENS:-TODOS}"
-          echo "Tamanho do lote: ${LOTE_SIZE:-5}"
-          echo "=========================================="
-          python atualizar_precos_catalogo.py
-
-      - name: 10. Desconectar WARP
-        run: |
-          echo "=========================================="
-          echo "DESCONECTANDO CLOUDFLARE WARP"
-          echo "=========================================="
-          echo "WARP desconectado"
-          echo "=========================================="
-
-      - name: 11. Verificar IP final
-        if: always()
-        run: |
-          echo "=========================================="
-          echo "IP FINAL:"
-          curl -s https://api.ipify.org
-          echo ""
-          echo "=========================================="
-
-      - name: 12. Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: logs-precos-${{ github.run_number }}
-          path: logs/*.log
-          retention-days: 30
-          if-no-files-found: warn
-
-      - name: 13. Resumo da execução
-        if: always()
-        run: |
-          echo "## 📊 Resumo da Sincronização" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Run Number:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tipo de Execução:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Horário (UTC):** $(date -u '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "${{ inputs.use_warp }}" = "true" ]; then
-              echo "- **Cloudflare WARP:** ✅ Habilitado" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "- **Cloudflare WARP:** ❌ Desabilitado" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "- **Limite de Itens:** TODOS (execução agendada)" >> $GITHUB_STEP_SUMMARY
-            echo "- **Tamanho do Lote:** 5" >> $GITHUB_STEP_SUMMARY
-            echo "- **Cloudflare WARP:** ✅ Habilitado" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if ls logs/*.log 1> /dev/null 2>&1; then
-            echo "### 📝 Últimas 50 linhas do log:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 50 logs/*.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️ Nenhum arquivo de log foi gerado." >> $GITHUB_STEP_SUMMARY
-          fi
+        run: python atualizar_precos_catalogo.py
