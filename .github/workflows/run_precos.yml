@@ -41,7 +41,27 @@ jobs:
       - name: 1. Checkout do código do repositório
         uses: actions/checkout@v4
 
-      - name: 2. Instalar Cloudflare WARP
+      - name: 2. Configurar ambiente Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: 3. Instalar dependências Python
+        run: pip install -r requirements.txt
+
+      - name: 4. Criar pasta de logs
+        run: mkdir -p logs
+
+      - name: 5. Verificar IP original
+        run: |
+          echo "=========================================="
+          echo "IP ORIGINAL DO GITHUB ACTIONS:"
+          curl -s https://api.ipify.org
+          echo ""
+          echo "=========================================="
+
+      - name: 6. Instalar Cloudflare WARP (se necessário)
         run: |
           echo "=========================================="
           echo "INSTALANDO CLOUDFLARE WARP"
@@ -58,64 +78,68 @@ jobs:
           echo "WARP instalado com sucesso!"
           echo "=========================================="
 
-      - name: 3. Verificar IP antes do WARP
+      - name: 7. Conectar ao Cloudflare WARP
         run: |
           echo "=========================================="
-          echo "IP ORIGINAL DO GITHUB ACTIONS:"
+          echo "CONECTANDO AO CLOUDFLARE WARP"
+          echo "=========================================="
+          
+          # Registrar o cliente WARP
+          warp-cli --accept-tos register
+          
+          # Conectar ao WARP
+          warp-cli --accept-tos connect
+          
+          # Aguardar conexão estabelecer
+          echo "Aguardando conexão WARP..."
+          sleep 10
+          
+          # Verificar status
+          warp-cli status
+          
+          echo "=========================================="
+
+      - name: 8. Verificar novo IP (com WARP)
+        run: |
+          echo "=========================================="
+          echo "NOVO IP COM CLOUDFLARE WARP:"
           curl -s https://api.ipify.org
           echo ""
           echo "=========================================="
 
-      - name: 4. Configurar ambiente Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: 5. Instalar dependências Python
-        run: pip install -r requirements.txt
-
-      - name: 6. Criar pasta de logs
-        run: mkdir -p logs
-
-      - name: 6.5. Debug - Verificar variáveis de ambiente
-        run: |
-          echo "=========================================="
-          echo "DEBUG: VARIÁVEIS DE AMBIENTE"
-          echo "=========================================="
-          echo "Event name: ${{ github.event_name }}"
-          echo "Use WARP input: ${{ inputs.use_warp }}"
-          echo "LIMITE_ITENS: '${{ inputs.limite_itens }}'"
-          echo "LOTE_SIZE: '${{ inputs.lote_size }}'"
-          
-          # Calcular USE_CLOUDFLARE_WARP
-          if [ "${{ github.event_name }}" == "schedule" ]; then
-            echo "USE_CLOUDFLARE_WARP: 'true' (schedule)"
-          elif [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ inputs.use_warp }}" == "true" ]; then
-            echo "USE_CLOUDFLARE_WARP: 'true' (manual com WARP)"
-          else
-            echo "USE_CLOUDFLARE_WARP: 'false' (manual sem WARP)"
-          fi
-          echo "=========================================="
-
-      - name: 7. Executar script de atualização de preços
+      - name: 9. Executar script de atualização de preços
         env:
           COCKROACHDB_CONN_STRING: ${{ secrets.COCKROACHDB_CONN_STRING }}
           LIMITE_ITENS: ${{ inputs.limite_itens }}
           LOTE_SIZE: ${{ inputs.lote_size }}
         run: |
-          echo "Iniciando script Python..."
-          echo "USE_CLOUDFLARE_WARP=$USE_CLOUDFLARE_WARP"
+          echo "=========================================="
+          echo "INICIANDO SCRIPT PYTHON"
+          echo "=========================================="
+          echo "Cloudflare WARP: $USE_CLOUDFLARE_WARP"
+          echo "Limite de itens: ${LIMITE_ITENS:-TODOS}"
+          echo "Tamanho do lote: ${LOTE_SIZE:-5}"
+          echo "=========================================="
           python atualizar_precos_catalogo.py
 
-      - name: 8. Desconectar WARP
+      - name: 10. Desconectar WARP
         run: |
           echo "=========================================="
-          echo "DESCONECTANDO WARP"
+          echo "DESCONECTANDO CLOUDFLARE WARP"
           echo "=========================================="
           echo "WARP desconectado"
+          echo "=========================================="
 
-      - name: 9. Upload logs
+      - name: 11. Verificar IP final
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "IP FINAL:"
+          curl -s https://api.ipify.org
+          echo ""
+          echo "=========================================="
+
+      - name: 12. Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -124,7 +148,7 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: 10. Resumo da execução
+      - name: 13. Resumo da execução
         if: always()
         run: |
           echo "## 📊 Resumo da Sincronização" >> $GITHUB_STEP_SUMMARY
@@ -134,7 +158,6 @@ jobs:
           echo "- **Horário (UTC):** $(date -u '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "- **Cloudflare WARP:** ${{ inputs.use_warp }}" >> $GITHUB_STEP_SUMMARY
           else
             echo "- **Limite de Itens:** TODOS (execução agendada)" >> $GITHUB_STEP_SUMMARY
             echo "- **Tamanho do Lote:** 5" >> $GITHUB_STEP_SUMMARY
@@ -146,6 +169,7 @@ jobs:
           if [ -f logs/*.log ]; then
             echo "### 📝 Últimas 50 linhas do log:" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 50 logs/*.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ Nenhum arquivo de log foi gerado." >> $GITHUB_STEP_SUMMARY
