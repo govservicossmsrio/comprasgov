@@ -12,30 +12,72 @@ import pandas as pd
 import io
 import re
 import random
+from pathlib import Path
 from charset_normalizer import from_bytes
 from ftfy import fix_text
 
-# --- Configuração ---
+# --- Configuração de Logs ---
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+
+log_filename = log_dir / f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+# --- Carrega e Valida Variáveis de Ambiente ---
+print("\n" + "="*80)
+print("CARREGANDO CONFIGURAÇÕES")
+print("="*80)
+
+env_path = Path('dbconnection.env')
+if not env_path.exists():
+    print(f"ERRO: Arquivo dbconnection.env não encontrado em: {env_path.absolute()}")
+    print("\nCrie o arquivo dbconnection.env com o seguinte conteúdo:")
+    print("COCKROACHDB_CONN_STRING=postgresql://usuario:senha@host:26257/database?sslmode=verify-full")
+    print("="*80 + "\n")
+    exit(1)
+
+print(f"Arquivo dbconnection.env encontrado: {env_path.absolute()}")
+
 load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
-LOTE_SIZE = 5
-TIMEOUT_LOTE = 300.0  # 5 minutos
-TIMEOUT_TOTAL = 120  # Timeout total da requisição
-TIMEOUT_CONNECT = 30  # Timeout para estabelecer conexão
-TIMEOUT_READ = 90  # Timeout para ler dados
+
+if not CONN_STRING:
+    print("\nERRO: Variável COCKROACHDB_CONN_STRING não encontrada no arquivo dbconnection.env")
+    print("\nVerifique se o arquivo dbconnection.env contém:")
+    print("COCKROACHDB_CONN_STRING=postgresql://...")
+    print("\nNOTA: Não deve haver espaços antes ou depois do '='")
+    print("="*80 + "\n")
+    exit(1)
+
+if '@' in CONN_STRING:
+    parts = CONN_STRING.split('@')
+    host_info = parts[1] if len(parts) > 1 else 'não identificado'
+    print(f"String de conexão carregada com sucesso")
+    print(f"Host: {host_info.split('/')[0]}")
+else:
+    print(f"String de conexão: {CONN_STRING[:30]}...")
+
+print("="*80 + "\n")
+
+# --- Configurações ---
+# Permite configurar tamanho do lote via variável de ambiente (para GitHub Actions)
+LOTE_SIZE = int(os.getenv('LOTE_SIZE', '5'))
+TIMEOUT_LOTE = 300.0
+TIMEOUT_TOTAL = 120
+TIMEOUT_CONNECT = 30
+TIMEOUT_READ = 90
 MAX_RETRIES = 5
 
-# User-Agents para rotação
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -56,12 +98,6 @@ def normalizar_nome_coluna(nome: str) -> str:
     return s.lower().strip('_')
 
 def gerar_id_item_compra(codigo_uasg: str, modalidade: str, id_contratacao: str, numero_item: str) -> Optional[str]:
-    """
-    Gera o ID do item de compra no formato:
-    unidade_uasg_codigo (6 dígitos) + modalidade (2 dígitos) + id_contratacao (9 dígitos) + numero_item (5 dígitos)
-    
-    Exemplo: 986001 + 03 + 900012024 + 00001 = 9860010390001202400001
-    """
     try:
         codigo_uasg = str(codigo_uasg).strip()
         modalidade = str(modalidade).strip()
@@ -76,17 +112,11 @@ def gerar_id_item_compra(codigo_uasg: str, modalidade: str, id_contratacao: str,
         id_contratacao_fmt = id_contratacao.zfill(9)
         numero_item_fmt = numero_item.zfill(5)
         
-        id_item_compra = f"{codigo_uasg_fmt}{modalidade_fmt}{id_contratacao_fmt}{numero_item_fmt}"
-        
-        return id_item_compra
+        return f"{codigo_uasg_fmt}{modalidade_fmt}{id_contratacao_fmt}{numero_item_fmt}"
     except (ValueError, AttributeError):
         return None
 
 def converter_valor_brasileiro(valor_str: Any) -> Optional[Decimal]:
-    """
-    Converte valores no formato brasileiro (162.800,5477) para Decimal.
-    Preserva precisão exata de casas decimais.
-    """
     if valor_str is None:
         return None
     
@@ -104,12 +134,9 @@ def converter_valor_brasileiro(valor_str: Any) -> Optional[Decimal]:
     
     try:
         valor_str = valor_str.strip()
-        
         if not valor_str:
             return None
-        
         valor_str = valor_str.replace('.', '').replace(',', '.')
-        
         return Decimal(valor_str)
     except (ValueError, InvalidOperation, AttributeError):
         return None
@@ -131,16 +158,29 @@ def _decode_and_clean_csv(raw_bytes: bytes) -> str:
 
 def get_db_connection():
     try:
+        logger.info("Tentando conectar ao banco de dados...")
         conn = psycopg2.connect(CONN_STRING)
         logger.info("Conexão com banco de dados estabelecida com sucesso")
         return conn
     except psycopg2.OperationalError as e:
-        logger.error(f"Falha ao criar conexão inicial: {e}")
+        logger.error(f"Falha ao conectar ao banco: {e}")
+        logger.error("\nVerifique:")
+        logger.error("1. A string de conexão está correta no arquivo dbconnection.env")
+        logger.error("2. O cluster CockroachDB está ativo")
+        logger.error("3. Você tem acesso à internet")
+        logger.error("4. As credenciais (usuário/senha) estão corretas")
+        return None
+    except Exception as e:
+        logger.error(f"Erro inesperado ao conectar: {e}")
         return None
 
-def get_itens_para_processar(conn) -> Dict[str, Dict]:
+def get_itens_para_processar(conn, limite: Optional[int] = None) -> Dict[str, Dict]:
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute("SELECT DISTINCT codigo, TRIM(LOWER(tipo)) as tipo FROM itens_catalogo WHERE codigo IS NOT NULL AND tipo IS NOT NULL;")
+        query = "SELECT DISTINCT codigo, TRIM(LOWER(tipo)) as tipo FROM itens_catalogo WHERE codigo IS NOT NULL AND tipo IS NOT NULL"
+        if limite:
+            query += f" LIMIT {limite}"
+        
+        cur.execute(query)
         itens_base = cur.fetchall()
         
         if not itens_base:
@@ -156,13 +196,13 @@ def get_itens_para_processar(conn) -> Dict[str, Dict]:
             } for item in itens_base
         }
         
-        logger.info(f"Encontrados {len(itens_para_processar)} itens únicos para verificar.")
+        logger.info(f"Encontrados {len(itens_para_processar)} itens para processar")
         return itens_para_processar
 
 def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> Tuple[int, int, int]:
-    total_novos, total_atualizados, total_erros_db = 0, 0, 0
+    total_novos, total_erros_db = 0, 0
     
-    logger.info(f"Iniciando salvamento de {len(resultados_lote)} itens no banco de dados...")
+    logger.info(f"Iniciando salvamento de {len(resultados_lote)} itens...")
     
     for resultado in resultados_lote:
         conn = None
@@ -175,7 +215,7 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                 logger.info(f"Item {codigo_item}: Nenhum preço para processar")
                 continue
 
-            logger.info(f"Processando item {codigo_item} com {len(precos_api)} preços da API...")
+            logger.info(f"Processando item {codigo_item} com {len(precos_api)} preços...")
 
             conn = psycopg2.connect(conn_string)
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -191,24 +231,18 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     numero_item_compra = p.get('numero_item_compra') or ''
                     
                     id_item_compra = gerar_id_item_compra(
-                        codigo_uasg,
-                        modalidade,
-                        id_compra_api,
-                        numero_item_compra
+                        codigo_uasg, modalidade, id_compra_api, numero_item_compra
                     )
                     
                     if not id_item_compra:
                         erros_id_item += 1
-                        if erros_id_item <= 3:
-                            logger.warning(f"Item {codigo_item}: Não foi possível gerar id_item_compra. UASG={codigo_uasg}, Mod={modalidade}, ID={id_compra_api}, NumItem={numero_item_compra}")
                         continue
                     
                     ni_fornecedor_api = (
                         p.get('ni_fornecedor') or
                         p.get('cnpj_vencedor') or 
                         p.get('cnpj_fornecedor') or 
-                        p.get('cnpj') or
-                        ''
+                        p.get('cnpj') or ''
                     )
                     
                     if not ni_fornecedor_api:
@@ -219,8 +253,7 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         p.get('preco_unitario') or
                         p.get('valor_unitario_homologado') or 
                         p.get('valor_unitario') or 
-                        p.get('valor') or
-                        None
+                        p.get('valor') or None
                     )
                     
                     valor_unitario = converter_valor_brasileiro(valor_unitario_str)
@@ -236,8 +269,7 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         p.get('nome_unidade_medida') or
                         p.get('unidade_fornecimento') or 
                         p.get('unidade_medida') or 
-                        p.get('unidade') or
-                        None
+                        p.get('unidade') or None
                     )
                     
                     quantidade_str = p.get('quantidade') or p.get('quantidade_item') or None
@@ -255,45 +287,33 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     nome_fornecedor = (
                         p.get('nome_fornecedor') or
                         p.get('nome_vencedor') or 
-                        p.get('fornecedor') or
-                        None
+                        p.get('fornecedor') or None
                     )
                     
                     data_resultado = (
                         p.get('data_resultado') or
                         p.get('data_compra') or 
-                        p.get('data') or
-                        None
+                        p.get('data') or None
                     )
                     
                     precos_validos.append((
-                        codigo_item,
-                        tipo_item,
-                        descricao,
-                        unidade,
-                        quantidade,
-                        valor_unitario,
-                        valor_total,
-                        ni_fornecedor_api,
-                        nome_fornecedor,
-                        id_item_compra,
-                        data_resultado,
-                        datetime.now()
+                        codigo_item, tipo_item, descricao, unidade,
+                        quantidade, valor_unitario, valor_total,
+                        ni_fornecedor_api, nome_fornecedor,
+                        id_item_compra, data_resultado, datetime.now()
                     ))
                 
                 if precos_ignorados > 0:
-                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados (NI fornecedor ausente)")
+                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados (NI ausente)")
                 
                 if erros_conversao > 0:
-                    logger.warning(f"Item {codigo_item}: {erros_conversao} preços com erro de conversão de valor")
+                    logger.warning(f"Item {codigo_item}: {erros_conversao} erros de conversão")
                 
                 if erros_id_item > 0:
-                    logger.warning(f"Item {codigo_item}: {erros_id_item} preços sem id_item_compra válido")
-                
-                logger.info(f"Item {codigo_item}: {len(precos_validos)} preços válidos para processar")
+                    logger.warning(f"Item {codigo_item}: {erros_id_item} sem id_item_compra válido")
                 
                 if precos_validos:
-                    logger.info(f"Executando UPSERT para {len(precos_validos)} preços do item {codigo_item}...")
+                    logger.info(f"Salvando {len(precos_validos)} preços do item {codigo_item}...")
                     
                     template = """
                         INSERT INTO precos_catalogo 
@@ -314,35 +334,22 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                             data_atualizacao = EXCLUDED.data_atualizacao
                     """
                     
-                    psycopg2.extras.execute_values(
-                        cur,
-                        template,
-                        precos_validos,
-                        page_size=1000
-                    )
-                    
+                    psycopg2.extras.execute_values(cur, template, precos_validos, page_size=1000)
                     total_novos += len(precos_validos)
-                    logger.info(f"Item {codigo_item}: {len(precos_validos)} preços processados com sucesso!")
+                    logger.info(f"Item {codigo_item}: {len(precos_validos)} preços salvos com sucesso")
             
             conn.commit()
-            logger.info(f"Item {codigo_item}: Transação commitada com sucesso")
             
         except Exception as e:
-            logger.error(f"Erro de DB para item {resultado.get('codigo', 'N/A')}: {e}", exc_info=True)
+            logger.error(f"Erro de DB para item {resultado.get('codigo', 'N/A')}: {e}")
             total_erros_db += 1
             if conn:
                 conn.rollback()
-                logger.warning(f"Rollback executado para item {resultado.get('codigo', 'N/A')}")
         finally:
             if conn:
                 conn.close()
     
-    if total_novos > 0:
-        logger.info(f"LOTE COMPLETO: {total_novos} preços processados")
-    else:
-        logger.info(f"LOTE COMPLETO: Nenhuma alteração necessária no banco")
-            
-    return total_novos, total_atualizados, total_erros_db
+    return total_novos, 0, total_erros_db
 
 # --- Funções de Coleta ---
 
@@ -367,14 +374,12 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
     else:
         logger.info(f"Buscando item {codigo_item} (histórico completo)...")
 
-    all_dfs, current_page, retries = [], 1, 0
+    all_dfs, current_page, retries, connection_errors = [], 1, 0, 0
     sucesso_coleta = True
-    connection_errors = 0
     
     while True:
         params['pagina'] = current_page
         
-        # MELHORIA 1: Rotação de User-Agent
         headers = {
             'accept': 'text/csv',
             'User-Agent': random.choice(USER_AGENTS),
@@ -385,50 +390,41 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
         }
         
         try:
-            # MELHORIA 2: Timeout de conexão separado
             timeout = aiohttp.ClientTimeout(
                 total=TIMEOUT_TOTAL,
                 connect=TIMEOUT_CONNECT,
                 sock_read=TIMEOUT_READ
             )
             
-            async with session.get(
-                base_url,
-                params=params,
-                headers=headers,
-                timeout=timeout,
-                ssl=True
-            ) as response:
-                
-                # Reset contador de erros de conexão em caso de sucesso
+            async with session.get(base_url, params=params, headers=headers, timeout=timeout, ssl=True) as response:
                 connection_errors = 0
                 
                 if response.status == 429:
                     if retries < MAX_RETRIES:
                         wait_time = 5 * (2 ** retries)
-                        logger.warning(f"Item {codigo_item}: Rate limit (429) na página {current_page}. Tentativa {retries+1}/{MAX_RETRIES}. Aguardando {wait_time}s...")
+                        logger.warning(f"Item {codigo_item}: Rate limit. Aguardando {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         retries += 1
                         continue
                     else:
-                        logger.error(f"Item {codigo_item}: Rate limit excedido após {MAX_RETRIES} tentativas.")
+                        logger.error(f"Item {codigo_item}: Rate limit excedido")
                         sucesso_coleta = False
                         break
                 
                 if response.status == 503:
                     if retries < MAX_RETRIES:
                         wait_time = 10 * (2 ** retries)
-                        logger.warning(f"Item {codigo_item}: Serviço indisponível (503) na página {current_page}. Aguardando {wait_time}s...")
+                        logger.warning(f"Item {codigo_item}: Serviço indisponível. Aguardando {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         retries += 1
                         continue
                     else:
-                        logger.error(f"Item {codigo_item}: Serviço indisponível após {MAX_RETRIES} tentativas.")
+                        logger.error(f"Item {codigo_item}: Serviço indisponível")
                         sucesso_coleta = False
                         break
                 
                 if response.status != 200:
-                    logger.warning(f"Item {codigo_item}: Status {response.status} na página {current_page}")
+                    logger.warning(f"Item {codigo_item}: Status {response.status}")
                     break
                 
                 retries = 0
@@ -456,26 +452,24 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 all_dfs.append(df_page)
                 current_page += 1
                 
-                # MELHORIA 4: Delay aleatório entre requisições
                 delay = random.uniform(0.5, 1.5)
                 await asyncio.sleep(delay)
         
-        # MELHORIA 3: Retry específico para erros de conexão
         except (aiohttp.ClientError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as e:
             connection_errors += 1
             
             if connection_errors <= MAX_RETRIES:
                 wait_time = 5 * (2 ** connection_errors)
-                logger.warning(f"Item {codigo_item}: Erro de conexão ({type(e).__name__}) na página {current_page}. Tentativa {connection_errors}/{MAX_RETRIES}. Aguardando {wait_time}s...")
+                logger.warning(f"Item {codigo_item}: Erro de conexão. Tentativa {connection_errors}/{MAX_RETRIES}. Aguardando {wait_time}s...")
                 await asyncio.sleep(wait_time)
                 continue
             else:
-                logger.error(f"Item {codigo_item}: Falha de conexão após {MAX_RETRIES} tentativas: {e}")
+                logger.error(f"Item {codigo_item}: Falha de conexão após {MAX_RETRIES} tentativas")
                 sucesso_coleta = False
                 break
         
         except Exception as e:
-            logger.error(f"Erro inesperado para item {codigo_item}: {type(e).__name__} - {e}", exc_info=False)
+            logger.error(f"Erro inesperado para item {codigo_item}: {type(e).__name__}")
             sucesso_coleta = False
             break
     
@@ -488,7 +482,7 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
             precos_coletados = full_df.to_dict('records')
             logger.info(f"SUCESSO: {len(precos_coletados)} preços coletados para o item {codigo_item}")
         except Exception as e:
-            logger.error(f"Erro ao concatenar/processar DataFrame para o item {codigo_item}: {e}")
+            logger.error(f"Erro ao processar DataFrame para item {codigo_item}: {e}")
             sucesso_coleta = False
 
     return {
@@ -498,7 +492,7 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
         'sucesso': sucesso_coleta
     }
 
-# --- Orquestração Principal ---
+# --- Orquestração ---
 
 async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
     itens_falhados = []
@@ -507,9 +501,10 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
     for i in range(0, len(itens_para_processar_lista), LOTE_SIZE):
         lote_atual = itens_para_processar_lista[i:i + LOTE_SIZE]
         lote_num = i//LOTE_SIZE + 1
+        
         logger.info(f"\n{'='*60}")
         logger.info(f"PROCESSANDO LOTE {lote_num}/{total_lotes}")
-        logger.info(f"{'='*60}\n")
+        logger.info(f"{'='*60}")
 
         tasks = {
             asyncio.create_task(
@@ -526,12 +521,11 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
                 try:
                     resultados_coleta.append(task.result())
                 except Exception as e:
-                    logger.error(f"Erro ao obter resultado da tarefa {task.get_name()}: {e}")
+                    logger.error(f"Erro na tarefa {task.get_name()}: {e}")
 
         if pending:
-            logger.warning(f"{len(pending)} tarefa(s) não concluída(s) dentro do timeout de {TIMEOUT_LOTE}s")
+            logger.warning(f"{len(pending)} tarefa(s) não concluída(s)")
             for task in pending:
-                logger.warning(f"  Tarefa pendente: {task.get_name()}")
                 task.cancel()
 
         codigos_sucesso_coleta = {res['codigo'] for res in resultados_coleta if res['sucesso']}
@@ -541,37 +535,29 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
 
         resultados_validos = [res for res in resultados_coleta if res and res['sucesso']]
         
-        logger.info(f"\n{'='*60}")
-        logger.info(f"SALVANDO LOTE {lote_num}/{total_lotes} NO BANCO DE DADOS")
-        logger.info(f"{'='*60}\n")
-        
         if resultados_validos:
-            novos, atualizados, erros_db = sync_lote_precos_catalogo(CONN_STRING, resultados_validos)
+            novos, _, erros_db = sync_lote_precos_catalogo(CONN_STRING, resultados_validos)
             stats['precos_novos'] += novos
-            stats['precos_atualizados'] += atualizados
             stats['erros'] += erros_db
             
-            logger.info(f"\n{'='*60}")
-            logger.info(f"LOTE {lote_num}/{total_lotes} CONCLUIDO")
+            logger.info(f"\nLOTE {lote_num}/{total_lotes} CONCLUIDO")
             logger.info(f"   Processados: {novos} | Erros: {erros_db}")
-            logger.info(f"{'='*60}\n")
-        else:
-            logger.warning(f"Nenhum resultado válido para salvar no lote {lote_num}/{total_lotes}")
         
         stats['itens_processados'] += len(lote_atual)
     
     return itens_falhados
 
-async def main():
+async def main(limite_itens: Optional[int] = None):
     logger.info("Iniciando sincronização de preços do catálogo...")
+    logger.info(f"Log salvo em: {log_filename}")
     
     conn = get_db_connection()
     if not conn:
-        logger.error("Não foi possível conectar ao banco de dados. Encerrando.")
+        logger.error("Não foi possível conectar ao banco. Encerrando.")
         return
     
     try:
-        itens_para_processar = get_itens_para_processar(conn)
+        itens_para_processar = get_itens_para_processar(conn, limite=limite_itens)
     finally:
         conn.close()
 
@@ -583,19 +569,17 @@ async def main():
         'total_itens': len(itens_para_processar),
         'itens_processados': 0,
         'precos_novos': 0,
-        'precos_atualizados': 0,
         'erros': 0
     }
     
     itens_lista = list(itens_para_processar.items())
 
-    # Configuração otimizada do connector
     connector = aiohttp.TCPConnector(
-        limit=10,  # Máximo de conexões simultâneas
-        limit_per_host=5,  # Máximo por host
-        ttl_dns_cache=300,  # Cache DNS por 5 minutos
+        limit=10,
+        limit_per_host=5,
+        ttl_dns_cache=300,
         enable_cleanup_closed=True,
-        force_close=False,  # Reutiliza conexões
+        force_close=False,
         ssl=True
     )
     
@@ -605,32 +589,21 @@ async def main():
         sock_read=TIMEOUT_READ
     )
 
-    async with aiohttp.ClientSession(
-        connector=connector,
-        timeout=timeout,
-        trust_env=True
-    ) as session:
-        logger.info(f"\n{'='*60}")
-        logger.info("INICIANDO PRIMEIRA PASSAGEM")
-        logger.info(f"{'='*60}\n")
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=True) as session:
+        logger.info("\nINICIANDO PRIMEIRA PASSAGEM")
         
-        itens_falhados_passo1 = await processar_e_salvar_lotes(session, itens_lista, stats)
+        itens_falhados = await processar_e_salvar_lotes(session, itens_lista, stats)
 
-        if itens_falhados_passo1:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"INICIANDO RETENTATIVA PARA {len(itens_falhados_passo1)} ITENS")
-            logger.info(f"{'='*60}\n")
-            
+        if itens_falhados:
+            logger.info(f"\nINICIANDO RETENTATIVA PARA {len(itens_falhados)} ITENS")
             stats['itens_processados'] = 0
-            itens_falhados_passo2 = await processar_e_salvar_lotes(session, itens_falhados_passo1, stats)
+            itens_falhados_final = await processar_e_salvar_lotes(session, itens_falhados, stats)
             
-            if itens_falhados_passo2:
-                logger.error(f"\n{'='*60}")
-                logger.error("ITENS COM FALHA PERSISTENTE")
-                logger.error(f"{'='*60}")
-                for codigo, _ in itens_falhados_passo2:
-                    logger.error(f"  Item {codigo} falhou em todas as tentativas")
-                stats['erros'] += len(itens_falhados_passo2)
+            if itens_falhados_final:
+                logger.error(f"\nITENS COM FALHA PERSISTENTE: {len(itens_falhados_final)}")
+                for codigo, _ in itens_falhados_final:
+                    logger.error(f"  Item {codigo}")
+                stats['erros'] += len(itens_falhados_final)
 
     logger.info(f"\n{'='*80}")
     logger.info("RESUMO FINAL DA SINCRONIZACAO")
@@ -639,7 +612,22 @@ async def main():
     logger.info(f"  Itens Processados: {stats['itens_processados']}")
     logger.info(f"  Preços Processados: {stats['precos_novos']}")
     logger.info(f"  Erros: {stats['erros']}")
-    logger.info(f"{'='*80}\n")
+    logger.info(f"{'='*80}")
+    logger.info(f"Log completo em: {log_filename}\n")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Permite configuração via variáveis de ambiente (para GitHub Actions)
+    LIMITE_ITENS_ENV = os.getenv('LIMITE_ITENS')
+    if LIMITE_ITENS_ENV:
+        LIMITE_ITENS = int(LIMITE_ITENS_ENV) if LIMITE_ITENS_ENV.strip() else None
+    else:
+        LIMITE_ITENS = None  # Processa todos os itens
+    
+    print("\n" + "="*80)
+    print("SINCRONIZACAO DE PRECOS DO CATALOGO")
+    print("="*80)
+    print(f"Limite de itens: {'TODOS' if LIMITE_ITENS is None else LIMITE_ITENS}")
+    print(f"Tamanho do lote: {LOTE_SIZE}")
+    print("="*80 + "\n")
+    
+    asyncio.run(main(limite_itens=LIMITE_ITENS))
