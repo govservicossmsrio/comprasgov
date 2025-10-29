@@ -27,8 +27,8 @@ load_dotenv(dotenv_path='dbconnection.env')
 
 CONN_STRING = os.getenv('COCKROACHDB_CONN_STRING')
 LOTE_SIZE = 5
-TIMEOUT_LOTE = 300.0  # 5 minutos (aumentado de 180s)
-TIMEOUT = 120  # Timeout individual aumentado também
+TIMEOUT_LOTE = 300.0  # 5 minutos
+TIMEOUT = 120
 MAX_RETRIES = 5
 
 # --- Funções Auxiliares ---
@@ -59,10 +59,10 @@ def _decode_and_clean_csv(raw_bytes: bytes) -> str:
 def get_db_connection():
     try:
         conn = psycopg2.connect(CONN_STRING)
-        logger.info("✅ Conexão com banco de dados estabelecida com sucesso")
+        logger.info("Conexão com banco de dados estabelecida com sucesso")
         return conn
     except psycopg2.OperationalError as e:
-        logger.error(f"❌ Falha ao criar conexão inicial: {e}")
+        logger.error(f"Falha ao criar conexão inicial: {e}")
         return None
 
 def get_itens_para_processar(conn) -> Dict[str, Dict]:
@@ -83,13 +83,13 @@ def get_itens_para_processar(conn) -> Dict[str, Dict]:
             } for item in itens_base
         }
         
-        logger.info(f"📊 Encontrados {len(itens_para_processar)} itens únicos para verificar.")
+        logger.info(f"Encontrados {len(itens_para_processar)} itens únicos para verificar.")
         return itens_para_processar
 
 def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> Tuple[int, int, int]:
     total_novos, total_atualizados, total_erros_db = 0, 0, 0
     
-    logger.info(f"💾 Iniciando salvamento de {len(resultados_lote)} itens no banco de dados...")
+    logger.info(f"Iniciando salvamento de {len(resultados_lote)} itens no banco de dados...")
     
     for resultado in resultados_lote:
         conn = None
@@ -99,10 +99,14 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
             precos_api = resultado['precos']
 
             if not precos_api:
-                logger.info(f"⚠️  Item {codigo_item}: Nenhum preço para processar")
+                logger.info(f"Item {codigo_item}: Nenhum preço para processar")
                 continue
 
-            logger.info(f"🔄 Processando item {codigo_item} com {len(precos_api)} preços da API...")
+            logger.info(f"Processando item {codigo_item} com {len(precos_api)} preços da API...")
+            
+            # DEBUG: Mostra as chaves do primeiro registro
+            if precos_api:
+                logger.info(f"DEBUG - Colunas disponíveis no primeiro registro: {list(precos_api[0].keys())}")
 
             conn = psycopg2.connect(conn_string)
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -111,24 +115,50 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                 precos_db = cur.fetchall()
                 precos_db_map = {f"{row['id_compra']}-{row['ni_fornecedor']}": row for row in precos_db}
                 
-                logger.info(f"📋 Item {codigo_item}: {len(precos_db_map)} preços existentes no banco")
+                logger.info(f"Item {codigo_item}: {len(precos_db_map)} preços existentes no banco")
                 
                 precos_para_inserir, precos_para_atualizar = [], []
+                precos_ignorados = 0
                 
                 for p in precos_api:
-                    id_compra_api = p.get('numero_compra', '')
-                    ni_fornecedor_api = p.get('cnpj_vencedor', '')
+                    # Tenta múltiplas variações de nomes de campos
+                    id_compra_api = (
+                        p.get('numero_compra') or 
+                        p.get('numero_da_compra') or 
+                        p.get('id_compra') or 
+                        p.get('compra') or
+                        ''
+                    )
+                    
+                    ni_fornecedor_api = (
+                        p.get('cnpj_vencedor') or 
+                        p.get('cnpj_fornecedor') or 
+                        p.get('cnpj') or 
+                        p.get('ni_fornecedor') or
+                        ''
+                    )
                     
                     if not id_compra_api or not ni_fornecedor_api:
+                        precos_ignorados += 1
+                        if precos_ignorados == 1:
+                            logger.warning(f"Item {codigo_item}: Registro sem numero_compra ou cnpj_vencedor. Campos disponíveis: {list(p.keys())}")
                         continue
                     
                     chave_api = f"{id_compra_api}-{ni_fornecedor_api}"
                     
-                    # Conversão segura do valor da API
+                    # Tenta múltiplas variações para valor unitário
+                    valor_unitario_str = (
+                        p.get('valor_unitario_homologado') or 
+                        p.get('valor_unitario') or 
+                        p.get('preco_unitario') or 
+                        p.get('valor') or
+                        '0'
+                    )
+                    
                     try:
-                        valor_unitario_api = float(p.get('valor_unitario_homologado', 0))
+                        valor_unitario_api = float(valor_unitario_str)
                     except (ValueError, TypeError):
-                        logger.warning(f"⚠️  Valor inválido na API para item {codigo_item}: {p.get('valor_unitario_homologado')}")
+                        logger.warning(f"Valor inválido na API para item {codigo_item}: {valor_unitario_str}")
                         continue
                     
                     preco_existente = precos_db_map.get(chave_api)
@@ -136,40 +166,91 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     if not preco_existente:
                         precos_para_inserir.append(p)
                     else:
-                        # CORREÇÃO CRÍTICA: Comparação adequada de valores
                         try:
                             valor_db = float(preco_existente['valor_unitario']) if preco_existente['valor_unitario'] is not None else 0.0
                             
-                            # Comparação com tolerância de 1 centavo
                             if abs(valor_unitario_api - valor_db) > 0.01:
                                 precos_para_atualizar.append(p)
-                                logger.debug(f"🔍 Diferença detectada para {chave_api}: API={valor_unitario_api}, DB={valor_db}")
+                                logger.debug(f"Diferença detectada para {chave_api}: API={valor_unitario_api}, DB={valor_db}")
                         except (ValueError, TypeError) as e:
-                            logger.warning(f"⚠️  Erro ao comparar valores para {chave_api}: {e}")
+                            logger.warning(f"Erro ao comparar valores para {chave_api}: {e}")
                             continue
                 
-                logger.info(f"📊 Item {codigo_item}: {len(precos_para_inserir)} para inserir, {len(precos_para_atualizar)} para atualizar")
+                if precos_ignorados > 0:
+                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados por falta de campos obrigatórios")
+                
+                logger.info(f"Item {codigo_item}: {len(precos_para_inserir)} para inserir, {len(precos_para_atualizar)} para atualizar")
                 
                 # Inserções
                 if precos_para_inserir:
-                    logger.info(f"➕ Inserindo {len(precos_para_inserir)} novos preços para item {codigo_item}...")
+                    logger.info(f"Inserindo {len(precos_para_inserir)} novos preços para item {codigo_item}...")
                     
-                    dados_insert = [
-                        (
+                    dados_insert = []
+                    for p in precos_para_inserir:
+                        # Busca campos com múltiplas variações
+                        descricao = p.get('descricao_item_catalogo') or p.get('descricao') or p.get('descricao_item') or None
+                        unidade = p.get('unidade_fornecimento') or p.get('unidade_medida') or p.get('unidade') or None
+                        quantidade = p.get('quantidade_item') or p.get('quantidade') or None
+                        
+                        valor_unitario = (
+                            p.get('valor_unitario_homologado') or 
+                            p.get('valor_unitario') or 
+                            p.get('preco_unitario') or 
+                            p.get('valor') or
+                            None
+                        )
+                        
+                        valor_total = (
+                            p.get('valor_total_homologado') or 
+                            p.get('valor_total') or 
+                            p.get('preco_total') or
+                            None
+                        )
+                        
+                        cnpj = (
+                            p.get('cnpj_vencedor') or 
+                            p.get('cnpj_fornecedor') or 
+                            p.get('cnpj') or 
+                            p.get('ni_fornecedor') or
+                            None
+                        )
+                        
+                        nome_fornecedor = (
+                            p.get('nome_vencedor') or 
+                            p.get('nome_fornecedor') or 
+                            p.get('fornecedor') or
+                            None
+                        )
+                        
+                        numero_compra = (
+                            p.get('numero_compra') or 
+                            p.get('numero_da_compra') or 
+                            p.get('id_compra') or 
+                            p.get('compra') or
+                            None
+                        )
+                        
+                        data_resultado = (
+                            p.get('data_resultado') or 
+                            p.get('data_compra') or 
+                            p.get('data') or
+                            None
+                        )
+                        
+                        dados_insert.append((
                             codigo_item,
                             tipo_item,
-                            p.get('descricao_item_catalogo'),
-                            p.get('unidade_fornecimento'),
-                            p.get('quantidade_item'),
-                            p.get('valor_unitario_homologado'),
-                            p.get('valor_total_homologado'),
-                            p.get('cnpj_vencedor'),
-                            p.get('nome_vencedor'),
-                            p.get('numero_compra'),
-                            p.get('data_resultado'),
+                            descricao,
+                            unidade,
+                            quantidade,
+                            valor_unitario,
+                            valor_total,
+                            cnpj,
+                            nome_fornecedor,
+                            numero_compra,
+                            data_resultado,
                             datetime.now()
-                        ) for p in precos_para_inserir
-                    ]
+                        ))
                     
                     psycopg2.extras.execute_values(
                         cur,
@@ -181,26 +262,75 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         dados_insert
                     )
                     total_novos += len(dados_insert)
-                    logger.info(f"✅ Item {codigo_item}: {len(dados_insert)} novos preços inseridos com sucesso!")
+                    logger.info(f"Item {codigo_item}: {len(dados_insert)} novos preços inseridos com sucesso!")
 
                 # Atualizações
                 if precos_para_atualizar:
-                    logger.info(f"🔄 Atualizando {len(precos_para_atualizar)} preços para item {codigo_item}...")
+                    logger.info(f"Atualizando {len(precos_para_atualizar)} preços para item {codigo_item}...")
                     
-                    dados_update = [
-                        (
-                            p.get('descricao_item_catalogo'),
-                            p.get('unidade_fornecimento'),
-                            p.get('quantidade_item'),
-                            p.get('valor_unitario_homologado'),
-                            p.get('valor_total_homologado'),
-                            p.get('nome_fornecedor'),
-                            p.get('data_resultado'),
+                    dados_update = []
+                    for p in precos_para_atualizar:
+                        descricao = p.get('descricao_item_catalogo') or p.get('descricao') or p.get('descricao_item') or None
+                        unidade = p.get('unidade_fornecimento') or p.get('unidade_medida') or p.get('unidade') or None
+                        quantidade = p.get('quantidade_item') or p.get('quantidade') or None
+                        
+                        valor_unitario = (
+                            p.get('valor_unitario_homologado') or 
+                            p.get('valor_unitario') or 
+                            p.get('preco_unitario') or 
+                            p.get('valor') or
+                            None
+                        )
+                        
+                        valor_total = (
+                            p.get('valor_total_homologado') or 
+                            p.get('valor_total') or 
+                            p.get('preco_total') or
+                            None
+                        )
+                        
+                        nome_fornecedor = (
+                            p.get('nome_vencedor') or 
+                            p.get('nome_fornecedor') or 
+                            p.get('fornecedor') or
+                            None
+                        )
+                        
+                        data_resultado = (
+                            p.get('data_resultado') or 
+                            p.get('data_compra') or 
+                            p.get('data') or
+                            None
+                        )
+                        
+                        numero_compra = (
+                            p.get('numero_compra') or 
+                            p.get('numero_da_compra') or 
+                            p.get('id_compra') or 
+                            p.get('compra') or
+                            None
+                        )
+                        
+                        cnpj = (
+                            p.get('cnpj_vencedor') or 
+                            p.get('cnpj_fornecedor') or 
+                            p.get('cnpj') or 
+                            p.get('ni_fornecedor') or
+                            None
+                        )
+                        
+                        dados_update.append((
+                            descricao,
+                            unidade,
+                            quantidade,
+                            valor_unitario,
+                            valor_total,
+                            nome_fornecedor,
+                            data_resultado,
                             codigo_item,
-                            p.get('numero_compra'),
-                            p.get('cnpj_vencedor')
-                        ) for p in precos_para_atualizar
-                    ]
+                            numero_compra,
+                            cnpj
+                        ))
                     
                     psycopg2.extras.execute_batch(
                         cur,
@@ -221,25 +351,25 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     
                     linhas_atualizadas = cur.rowcount
                     total_atualizados += linhas_atualizadas
-                    logger.info(f"✅ Item {codigo_item}: {linhas_atualizadas} linhas atualizadas com sucesso!")
+                    logger.info(f"Item {codigo_item}: {linhas_atualizadas} linhas atualizadas com sucesso!")
             
             conn.commit()
-            logger.info(f"✅ Item {codigo_item}: Transação commitada com sucesso")
+            logger.info(f"Item {codigo_item}: Transação commitada com sucesso")
             
         except Exception as e:
-            logger.error(f"❌ Erro de DB para item {resultado.get('codigo', 'N/A')}: {e}", exc_info=True)
+            logger.error(f"Erro de DB para item {resultado.get('codigo', 'N/A')}: {e}", exc_info=True)
             total_erros_db += 1
             if conn:
                 conn.rollback()
-                logger.warning(f"🔙 Rollback executado para item {resultado.get('codigo', 'N/A')}")
+                logger.warning(f"Rollback executado para item {resultado.get('codigo', 'N/A')}")
         finally:
             if conn:
                 conn.close()
     
     if total_novos > 0 or total_atualizados > 0:
-        logger.info(f"✅ LOTE COMPLETO: {total_novos} novos, {total_atualizados} atualizados")
+        logger.info(f"LOTE COMPLETO: {total_novos} novos, {total_atualizados} atualizados")
     else:
-        logger.info(f"ℹ️  LOTE COMPLETO: Nenhuma alteração necessária no banco")
+        logger.info(f"LOTE COMPLETO: Nenhuma alteração necessária no banco")
             
     return total_novos, total_atualizados, total_erros_db
 
@@ -262,9 +392,9 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
     if ultima_data:
         data_inicio_busca = ultima_data + timedelta(days=1)
         params['dataInicio'] = data_inicio_busca.strftime('%d/%m/%Y')
-        logger.info(f"🔍 Buscando item {codigo_item} (a partir de {params['dataInicio']})...")
+        logger.info(f"Buscando item {codigo_item} (a partir de {params['dataInicio']})...")
     else:
-        logger.info(f"🔍 Buscando item {codigo_item} (histórico completo)...")
+        logger.info(f"Buscando item {codigo_item} (histórico completo)...")
 
     all_dfs, current_page, retries = [], 1, 0
     sucesso_coleta = True
@@ -282,12 +412,12 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 if response.status == 429:
                     if retries < MAX_RETRIES:
                         wait_time = 5 * (2 ** retries)
-                        logger.warning(f"⏳ Item {codigo_item}: Rate limit (429) na página {current_page}. Tentativa {retries+1}/{MAX_RETRIES}. Aguardando {wait_time}s...")
+                        logger.warning(f"Item {codigo_item}: Rate limit (429) na página {current_page}. Tentativa {retries+1}/{MAX_RETRIES}. Aguardando {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         retries += 1
                         continue
                     else:
-                        logger.error(f"❌ Item {codigo_item}: Rate limit excedido após {MAX_RETRIES} tentativas. Desistindo deste item.")
+                        logger.error(f"Item {codigo_item}: Rate limit excedido após {MAX_RETRIES} tentativas. Desistindo deste item.")
                         sucesso_coleta = False
                         break
                 
@@ -321,7 +451,7 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 await asyncio.sleep(0.5)
                 
         except Exception as e:
-            logger.error(f"❌ Erro de rede/processamento para item {codigo_item}: {e}", exc_info=False)
+            logger.error(f"Erro de rede/processamento para item {codigo_item}: {e}", exc_info=False)
             sucesso_coleta = False
             break
     
@@ -332,9 +462,9 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
             full_df.columns = [normalizar_nome_coluna(col) for col in full_df.columns]
             full_df = full_df.where(pd.notna(full_df), None)
             precos_coletados = full_df.to_dict('records')
-            logger.info(f"✅ SUCESSO: {len(precos_coletados)} preços coletados para o item {codigo_item}")
+            logger.info(f"SUCESSO: {len(precos_coletados)} preços coletados para o item {codigo_item}")
         except Exception as e:
-            logger.error(f"❌ Erro ao concatenar/processar DataFrame para o item {codigo_item}: {e}")
+            logger.error(f"Erro ao concatenar/processar DataFrame para o item {codigo_item}: {e}")
             sucesso_coleta = False
 
     return {
@@ -354,7 +484,7 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
         lote_atual = itens_para_processar_lista[i:i + LOTE_SIZE]
         lote_num = i//LOTE_SIZE + 1
         logger.info(f"\n{'='*60}")
-        logger.info(f"📦 PROCESSANDO LOTE {lote_num}/{total_lotes}")
+        logger.info(f"PROCESSANDO LOTE {lote_num}/{total_lotes}")
         logger.info(f"{'='*60}\n")
 
         tasks = {
@@ -372,12 +502,12 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
                 try:
                     resultados_coleta.append(task.result())
                 except Exception as e:
-                    logger.error(f"❌ Erro ao obter resultado da tarefa {task.get_name()}: {e}")
+                    logger.error(f"Erro ao obter resultado da tarefa {task.get_name()}: {e}")
 
         if pending:
-            logger.warning(f"⏰ {len(pending)} tarefa(s) não concluída(s) dentro do timeout de {TIMEOUT_LOTE}s")
+            logger.warning(f"{len(pending)} tarefa(s) não concluída(s) dentro do timeout de {TIMEOUT_LOTE}s")
             for task in pending:
-                logger.warning(f"  ⏳ Tarefa pendente: {task.get_name()}")
+                logger.warning(f"  Tarefa pendente: {task.get_name()}")
                 task.cancel()
 
         codigos_sucesso_coleta = {res['codigo'] for res in resultados_coleta if res['sucesso']}
@@ -388,10 +518,9 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
         resultados_validos = [res for res in resultados_coleta if res and res['sucesso']]
         
         logger.info(f"\n{'='*60}")
-        logger.info(f"💾 SALVANDO LOTE {lote_num}/{total_lotes} NO BANCO DE DADOS")
+        logger.info(f"SALVANDO LOTE {lote_num}/{total_lotes} NO BANCO DE DADOS")
         logger.info(f"{'='*60}\n")
         
-        # Salva no banco de dados
         if resultados_validos:
             novos, atualizados, erros_db = sync_lote_precos_catalogo(CONN_STRING, resultados_validos)
             stats['precos_novos'] += novos
@@ -399,21 +528,21 @@ async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
             stats['erros'] += erros_db
             
             logger.info(f"\n{'='*60}")
-            logger.info(f"✅ LOTE {lote_num}/{total_lotes} CONCLUÍDO")
+            logger.info(f"LOTE {lote_num}/{total_lotes} CONCLUIDO")
             logger.info(f"{'='*60}\n")
         else:
-            logger.warning(f"⚠️  Nenhum resultado válido para salvar no lote {lote_num}/{total_lotes}")
+            logger.warning(f"Nenhum resultado válido para salvar no lote {lote_num}/{total_lotes}")
         
         stats['itens_processados'] += len(lote_atual)
     
     return itens_falhados
 
 async def main():
-    logger.info("🚀 Iniciando sincronização de preços do catálogo...")
+    logger.info("Iniciando sincronização de preços do catálogo...")
     
     conn = get_db_connection()
     if not conn:
-        logger.error("❌ Não foi possível conectar ao banco de dados. Encerrando.")
+        logger.error("Não foi possível conectar ao banco de dados. Encerrando.")
         return
     
     try:
@@ -422,7 +551,7 @@ async def main():
         conn.close()
 
     if not itens_para_processar:
-        logger.info("ℹ️  Nenhum item para processar.")
+        logger.info("Nenhum item para processar.")
         return
 
     stats = {
@@ -437,14 +566,14 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
         logger.info(f"\n{'='*60}")
-        logger.info("🎯 INICIANDO PRIMEIRA PASSAGEM")
+        logger.info("INICIANDO PRIMEIRA PASSAGEM")
         logger.info(f"{'='*60}\n")
         
         itens_falhados_passo1 = await processar_e_salvar_lotes(session, itens_lista, stats)
 
         if itens_falhados_passo1:
             logger.info(f"\n{'='*60}")
-            logger.info(f"🔄 INICIANDO RETENTATIVA PARA {len(itens_falhados_passo1)} ITENS")
+            logger.info(f"INICIANDO RETENTATIVA PARA {len(itens_falhados_passo1)} ITENS")
             logger.info(f"{'='*60}\n")
             
             stats['itens_processados'] = 0
@@ -452,20 +581,20 @@ async def main():
             
             if itens_falhados_passo2:
                 logger.error(f"\n{'='*60}")
-                logger.error("❌ ITENS COM FALHA PERSISTENTE")
+                logger.error("ITENS COM FALHA PERSISTENTE")
                 logger.error(f"{'='*60}")
                 for codigo, _ in itens_falhados_passo2:
-                    logger.error(f"  ❌ Item {codigo} falhou em todas as tentativas")
+                    logger.error(f"  Item {codigo} falhou em todas as tentativas")
                 stats['erros'] += len(itens_falhados_passo2)
 
     logger.info(f"\n{'='*80}")
-    logger.info("📊 RESUMO FINAL DA SINCRONIZAÇÃO")
+    logger.info("RESUMO FINAL DA SINCRONIZACAO")
     logger.info(f"{'='*80}")
-    logger.info(f"  📦 Total de Itens: {stats['total_itens']}")
-    logger.info(f"  ✅ Itens Processados: {stats['itens_processados']}")
-    logger.info(f"  ➕ Preços Novos: {stats['precos_novos']}")
-    logger.info(f"  🔄 Preços Atualizados: {stats['precos_atualizados']}")
-    logger.info(f"  ❌ Erros: {stats['erros']}")
+    logger.info(f"  Total de Itens: {stats['total_itens']}")
+    logger.info(f"  Itens Processados: {stats['itens_processados']}")
+    logger.info(f"  Preços Novos: {stats['precos_novos']}")
+    logger.info(f"  Preços Atualizados: {stats['precos_atualizados']}")
+    logger.info(f"  Erros: {stats['erros']}")
     logger.info(f"{'='*80}\n")
 
 if __name__ == "__main__":
