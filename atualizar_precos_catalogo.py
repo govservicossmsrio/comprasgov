@@ -41,6 +41,31 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
 
+def converter_valor_brasileiro(valor_str: Any) -> Optional[float]:
+    """
+    Converte valores no formato brasileiro (162.800,00) para float.
+    Retorna None se a conversão falhar.
+    """
+    if valor_str is None:
+        return None
+    
+    if isinstance(valor_str, (int, float)):
+        return float(valor_str)
+    
+    if not isinstance(valor_str, str):
+        valor_str = str(valor_str)
+    
+    try:
+        # Remove espaços em branco
+        valor_str = valor_str.strip()
+        
+        # Remove pontos (separador de milhar) e substitui vírgula por ponto
+        valor_str = valor_str.replace('.', '').replace(',', '.')
+        
+        return float(valor_str)
+    except (ValueError, AttributeError):
+        return None
+
 def _decode_and_clean_csv(raw_bytes: bytes) -> str:
     try:
         probe = from_bytes(raw_bytes).best()
@@ -104,9 +129,10 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
 
             logger.info(f"Processando item {codigo_item} com {len(precos_api)} preços da API...")
             
-            # DEBUG: Mostra as chaves do primeiro registro
+            # DEBUG: Mostra as colunas do primeiro registro apenas (sem printar todos os dados)
             if precos_api:
-                logger.info(f"DEBUG - Colunas disponíveis no primeiro registro: {list(precos_api[0].keys())}")
+                colunas = list(precos_api[0].keys())
+                logger.info(f"DEBUG - Total de colunas: {len(colunas)}, Primeiras 10: {colunas[:10]}")
 
             conn = psycopg2.connect(conn_string)
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -119,46 +145,46 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                 
                 precos_para_inserir, precos_para_atualizar = [], []
                 precos_ignorados = 0
+                erros_conversao = 0
                 
                 for p in precos_api:
-                    # Tenta múltiplas variações de nomes de campos
+                    # Busca campos obrigatórios
                     id_compra_api = (
+                        p.get('id_compra') or 
                         p.get('numero_compra') or 
                         p.get('numero_da_compra') or 
-                        p.get('id_compra') or 
                         p.get('compra') or
                         ''
                     )
                     
                     ni_fornecedor_api = (
+                        p.get('ni_fornecedor') or
                         p.get('cnpj_vencedor') or 
                         p.get('cnpj_fornecedor') or 
-                        p.get('cnpj') or 
-                        p.get('ni_fornecedor') or
+                        p.get('cnpj') or
                         ''
                     )
                     
                     if not id_compra_api or not ni_fornecedor_api:
                         precos_ignorados += 1
-                        if precos_ignorados == 1:
-                            logger.warning(f"Item {codigo_item}: Registro sem numero_compra ou cnpj_vencedor. Campos disponíveis: {list(p.keys())}")
                         continue
                     
                     chave_api = f"{id_compra_api}-{ni_fornecedor_api}"
                     
-                    # Tenta múltiplas variações para valor unitário
+                    # Busca valor unitário com múltiplas variações
                     valor_unitario_str = (
+                        p.get('preco_unitario') or
                         p.get('valor_unitario_homologado') or 
                         p.get('valor_unitario') or 
-                        p.get('preco_unitario') or 
                         p.get('valor') or
-                        '0'
+                        None
                     )
                     
-                    try:
-                        valor_unitario_api = float(valor_unitario_str)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Valor inválido na API para item {codigo_item}: {valor_unitario_str}")
+                    # Converte valor brasileiro para float
+                    valor_unitario_api = converter_valor_brasileiro(valor_unitario_str)
+                    
+                    if valor_unitario_api is None:
+                        erros_conversao += 1
                         continue
                     
                     preco_existente = precos_db_map.get(chave_api)
@@ -171,13 +197,16 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                             
                             if abs(valor_unitario_api - valor_db) > 0.01:
                                 precos_para_atualizar.append(p)
-                                logger.debug(f"Diferença detectada para {chave_api}: API={valor_unitario_api}, DB={valor_db}")
                         except (ValueError, TypeError) as e:
                             logger.warning(f"Erro ao comparar valores para {chave_api}: {e}")
                             continue
                 
+                # Log resumido de erros
                 if precos_ignorados > 0:
-                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados por falta de campos obrigatórios")
+                    logger.warning(f"Item {codigo_item}: {precos_ignorados} preços ignorados (campos obrigatórios ausentes)")
+                
+                if erros_conversao > 0:
+                    logger.warning(f"Item {codigo_item}: {erros_conversao} preços com erro de conversão de valor")
                 
                 logger.info(f"Item {codigo_item}: {len(precos_para_inserir)} para inserir, {len(precos_para_atualizar)} para atualizar")
                 
@@ -188,50 +217,63 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     dados_insert = []
                     for p in precos_para_inserir:
                         # Busca campos com múltiplas variações
-                        descricao = p.get('descricao_item_catalogo') or p.get('descricao') or p.get('descricao_item') or None
-                        unidade = p.get('unidade_fornecimento') or p.get('unidade_medida') or p.get('unidade') or None
-                        quantidade = p.get('quantidade_item') or p.get('quantidade') or None
+                        descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
                         
-                        valor_unitario = (
+                        unidade = (
+                            p.get('sigla_unidade_medida') or
+                            p.get('nome_unidade_medida') or
+                            p.get('unidade_fornecimento') or 
+                            p.get('unidade_medida') or 
+                            p.get('unidade') or
+                            None
+                        )
+                        
+                        quantidade = p.get('quantidade') or p.get('quantidade_item') or None
+                        
+                        valor_unitario_str = (
+                            p.get('preco_unitario') or
                             p.get('valor_unitario_homologado') or 
                             p.get('valor_unitario') or 
-                            p.get('preco_unitario') or 
                             p.get('valor') or
                             None
                         )
+                        valor_unitario = converter_valor_brasileiro(valor_unitario_str)
                         
-                        valor_total = (
-                            p.get('valor_total_homologado') or 
-                            p.get('valor_total') or 
-                            p.get('preco_total') or
-                            None
-                        )
+                        # Calcula valor total se não existir
+                        valor_total = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
+                        if valor_total:
+                            valor_total = converter_valor_brasileiro(valor_total)
+                        elif valor_unitario and quantidade:
+                            try:
+                                valor_total = valor_unitario * float(quantidade)
+                            except (ValueError, TypeError):
+                                valor_total = None
                         
                         cnpj = (
+                            p.get('ni_fornecedor') or
                             p.get('cnpj_vencedor') or 
                             p.get('cnpj_fornecedor') or 
-                            p.get('cnpj') or 
-                            p.get('ni_fornecedor') or
+                            p.get('cnpj') or
                             None
                         )
                         
                         nome_fornecedor = (
+                            p.get('nome_fornecedor') or
                             p.get('nome_vencedor') or 
-                            p.get('nome_fornecedor') or 
                             p.get('fornecedor') or
                             None
                         )
                         
                         numero_compra = (
+                            p.get('id_compra') or
                             p.get('numero_compra') or 
                             p.get('numero_da_compra') or 
-                            p.get('id_compra') or 
                             p.get('compra') or
                             None
                         )
                         
                         data_resultado = (
-                            p.get('data_resultado') or 
+                            p.get('data_resultado') or
                             p.get('data_compra') or 
                             p.get('data') or
                             None
@@ -270,52 +312,64 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     
                     dados_update = []
                     for p in precos_para_atualizar:
-                        descricao = p.get('descricao_item_catalogo') or p.get('descricao') or p.get('descricao_item') or None
-                        unidade = p.get('unidade_fornecimento') or p.get('unidade_medida') or p.get('unidade') or None
-                        quantidade = p.get('quantidade_item') or p.get('quantidade') or None
+                        descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
                         
-                        valor_unitario = (
+                        unidade = (
+                            p.get('sigla_unidade_medida') or
+                            p.get('nome_unidade_medida') or
+                            p.get('unidade_fornecimento') or 
+                            p.get('unidade_medida') or 
+                            p.get('unidade') or
+                            None
+                        )
+                        
+                        quantidade = p.get('quantidade') or p.get('quantidade_item') or None
+                        
+                        valor_unitario_str = (
+                            p.get('preco_unitario') or
                             p.get('valor_unitario_homologado') or 
                             p.get('valor_unitario') or 
-                            p.get('preco_unitario') or 
                             p.get('valor') or
                             None
                         )
+                        valor_unitario = converter_valor_brasileiro(valor_unitario_str)
                         
-                        valor_total = (
-                            p.get('valor_total_homologado') or 
-                            p.get('valor_total') or 
-                            p.get('preco_total') or
-                            None
-                        )
+                        valor_total = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
+                        if valor_total:
+                            valor_total = converter_valor_brasileiro(valor_total)
+                        elif valor_unitario and quantidade:
+                            try:
+                                valor_total = valor_unitario * float(quantidade)
+                            except (ValueError, TypeError):
+                                valor_total = None
                         
                         nome_fornecedor = (
+                            p.get('nome_fornecedor') or
                             p.get('nome_vencedor') or 
-                            p.get('nome_fornecedor') or 
                             p.get('fornecedor') or
                             None
                         )
                         
                         data_resultado = (
-                            p.get('data_resultado') or 
+                            p.get('data_resultado') or
                             p.get('data_compra') or 
                             p.get('data') or
                             None
                         )
                         
                         numero_compra = (
+                            p.get('id_compra') or
                             p.get('numero_compra') or 
                             p.get('numero_da_compra') or 
-                            p.get('id_compra') or 
                             p.get('compra') or
                             None
                         )
                         
                         cnpj = (
+                            p.get('ni_fornecedor') or
                             p.get('cnpj_vencedor') or 
                             p.get('cnpj_fornecedor') or 
-                            p.get('cnpj') or 
-                            p.get('ni_fornecedor') or
+                            p.get('cnpj') or
                             None
                         )
                         
