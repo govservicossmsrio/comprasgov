@@ -27,22 +27,11 @@ def normalizar_nome_coluna(nome: str) -> str:
     s = nome.strip(); s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s); s = re.sub(r'[^a-zA-Z0-9_]+', '_', s)
     return s.lower().strip('_')
 
-# =================================================================
-# A ALTERAÇÃO CRÍTICA ESTÁ AQUI
-# =================================================================
 def _decode_and_clean_csv(raw_bytes: bytes) -> str:
-    """Função de limpeza corrigida para a API moderna do charset-normalizer."""
     try:
-        # Tenta detectar a melhor codificação
         probe = from_bytes(raw_bytes).best()
-        if probe:
-            # A conversão direta do objeto probe para string é a forma correta
-            decoded_text = str(probe)
-        else:
-            # Fallback se a detecção falhar
-            decoded_text = raw_bytes.decode("utf-8", errors="replace")
+        decoded_text = str(probe) if probe else raw_bytes.decode("utf-8", errors="replace")
     except Exception:
-        # Fallback final para latin-1, comum em sistemas legados
         decoded_text = raw_bytes.decode("latin-1", errors="replace")
     
     fixed_text_content = fix_text(decoded_text)
@@ -66,6 +55,7 @@ def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, pre
     if not precos_api: return 0, 0
     novos, atualizados = 0, 0
     
+    # O bloco 'with' garante que a conexão será fechada, mas não faz commit automático.
     with psycopg2.connect(conn_string) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute("SELECT * FROM precos_catalogo WHERE codigo_item_catalogo = %s::VARCHAR", (codigo_item,))
@@ -95,6 +85,11 @@ def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, pre
                 dados_update = [(p.get('descricao_item_catalogo'), p.get('unidade_fornecimento'), p.get('quantidade_item'), p.get('valor_unitario_homologado'), p.get('valor_total_homologado'), p.get('nome_vencedor'), p.get('data_resultado'), codigo_item, p.get('numero_compra'), p.get('cnpj_vencedor')) for p in precos_para_atualizar]
                 psycopg2.extras.execute_batch(cur, "UPDATE precos_catalogo SET descricao_item = %s, unidade_medida = %s, quantidade_total = %s, valor_unitario = %s, valor_total = %s, nome_fornecedor = %s, data_compra = %s, data_atualizacao = CURRENT_TIMESTAMP WHERE codigo_item_catalogo = %s AND id_compra = %s AND ni_fornecedor = %s;", dados_update)
                 atualizados = len(dados_update)
+        
+        # >>> A CORREÇÃO DEFINITIVA ESTÁ AQUI <<<
+        # Confirma a transação, salvando permanentemente as alterações no banco.
+        conn.commit()
+        
     return novos, atualizados
 
 # --- Função de API Assíncrona ---
@@ -126,7 +121,7 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 current_page += 1
                 await asyncio.sleep(1)
         except Exception as e:
-            logging.error(f"Erro ao processar página {current_page} para item {codigo_item}: {e}", exc_info=False) # exc_info=False para não poluir o log
+            logging.error(f"Erro ao processar página {current_page} para item {codigo_item}: {e}", exc_info=False)
             break
     if not all_dfs: return []
     full_df = pd.concat(all_dfs, ignore_index=True)
@@ -148,14 +143,15 @@ async def process_itens_concorrently(conn_string: str, itens: List[Tuple[str, st
                     if precos:
                         try:
                             novos, atualizados = sync_precos_catalogo(conn_string, codigo, tipo, precos)
-                            stats['precos_novos'] += novos; stats['precos_atualizados'] += atualizados; stats['itens_processados'] += 1
-                            if novos > 0 or atualizados > 0: logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
+                            stats['precos_novos'] += novos; stats['precos_atualizados'] += atualizados
+                            if novos > 0 or atualizados > 0: 
+                                logging.info(f"Item {codigo}: Sincronizado ({novos} novos, {atualizados} atualizados).")
                         except Exception as db_error:
                             logging.error(f"Erro de banco de dados para item {codigo}: {db_error}"); stats['erros'] += 1
-                    elif precos is None: # Erro na busca
+                    elif precos is None:
                         stats['erros'] += 1
-                    else: # Lista vazia, mas sucesso
-                        stats['itens_processados'] += 1
+                    # Se a lista de preços estiver vazia, não faz nada, mas conta como processado.
+                    stats['itens_processados'] += 1
             except Exception as e:
                 logging.error(f"Erro crítico no fluxo do item {codigo}: {e}"); stats['erros'] += 1
     tasks = [fetch_and_sync(codigo, tipo) for codigo, tipo in itens]
