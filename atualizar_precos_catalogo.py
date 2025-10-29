@@ -45,53 +45,36 @@ def get_db_connection():
     except psycopg2.OperationalError as e: logging.error(f"Falha ao criar conexão inicial: {e}"); return None
 
 def get_itens_para_processar(conn) -> Dict[str, Dict]:
-    """
-    Busca todos os itens do catálogo e a data da última compra para cada um.
-    Retorna um dicionário: {'codigo': {'tipo': '...', 'ultima_data': ...}}
-    """
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        # Pega todos os itens únicos da tabela principal
         cur.execute("SELECT DISTINCT codigo, TRIM(LOWER(tipo)) as tipo FROM itens_catalogo WHERE codigo IS NOT NULL AND tipo IS NOT NULL;")
         itens_base = cur.fetchall()
-        if not itens_base:
-            return {}
+        if not itens_base: return {}
 
-        # Pega a data da última compra para cada item que já existe em precos_catalogo
-        cur.execute("""
-            SELECT codigo_item_catalogo, MAX(data_compra) as ultima_data
-            FROM precos_catalogo
-            GROUP BY codigo_item_catalogo;
-        """)
+        cur.execute("SELECT codigo_item_catalogo, MAX(data_compra) as ultima_data FROM precos_catalogo GROUP BY codigo_item_catalogo;")
         ultimas_datas = {row['codigo_item_catalogo']: row['ultima_data'] for row in cur}
 
-        # Monta o dicionário final
-        itens_para_processar = {}
-        for item in itens_base:
-            codigo = str(item['codigo'])
-            itens_para_processar[codigo] = {
+        itens_para_processar = {
+            str(item['codigo']): {
                 'tipo': item['tipo'],
-                'ultima_data': ultimas_datas.get(codigo) # Será None se o item for novo
-            }
+                'ultima_data': ultimas_datas.get(str(item['codigo']))
+            } for item in itens_base
+        }
         
         logging.info(f"Encontrados {len(itens_para_processar)} itens únicos para verificar.")
         return itens_para_processar
 
+# =================================================================
+# CORREÇÃO APLICADA AQUI: Revertendo para a lógica de SELECT estável
+# =================================================================
 def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, precos_api: List[Dict[str, Any]]) -> Tuple[int, int]:
     if not precos_api: return 0, 0
     novos, atualizados = 0, 0
     
     with psycopg2.connect(conn_string) as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            # Otimização: Busca apenas os preços que podem ser atualizados (novos já são tratados)
-            chaves_api = {f"{p.get('numero_compra', '')}-{p.get('cnpj_vencedor', '')}" for p in precos_api}
-            if chaves_api:
-                cur.execute("""
-                    SELECT * FROM precos_catalogo 
-                    WHERE codigo_item_catalogo = %s::VARCHAR 
-                """, (codigo_item, list(chaves_api)))
-                precos_db_map = {f"{row['id_compra']}-{row['ni_fornecedor']}": row for row in cur}
-            else:
-                precos_db_map = {}
+            # Lógica de SELECT revertida para a versão funcional e robusta
+            cur.execute("SELECT * FROM precos_catalogo WHERE codigo_item_catalogo = %s::VARCHAR", (codigo_item,))
+            precos_db_map = {f"{row['id_compra']}-{row['ni_fornecedor']}": row for row in cur}
 
             precos_para_inserir, precos_para_atualizar = [], []
             for p in precos_api:
@@ -105,6 +88,7 @@ def sync_precos_catalogo(conn_string: str, codigo_item: str, tipo_item: str, pre
                 if not preco_existente:
                     precos_para_inserir.append(p)
                 else:
+                    # Comparação segura de floats
                     if not psycopg2.extensions.Float(valor_unitario_api).isclose(preco_existente['valor_unitario']):
                         precos_para_atualizar.append(p)
             
@@ -128,14 +112,11 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
     
     params = {'codigoItemCatalogo': codigo_item, 'pagina': 1, 'tamanhoPagina': 500}
     
-    # >>> A LÓGICA DE OTIMIZAÇÃO ESTÁ AQUI <<<
     if ultima_data:
-        # Se temos uma data, buscamos apenas a partir do dia seguinte.
         data_inicio_busca = ultima_data + timedelta(days=1)
         params['dataInicio'] = data_inicio_busca.strftime('%d/%m/%Y')
         logging.info(f"Buscando item {codigo_item} (a partir de {params['dataInicio']})...")
     else:
-        # Se não temos data (item novo), buscamos o histórico completo.
         logging.info(f"Buscando item {codigo_item} (histórico completo)...")
 
     all_dfs, current_page = [], 1
