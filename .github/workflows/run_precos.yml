@@ -109,13 +109,17 @@ jobs:
           echo "- **Horário (UTC):** $(date -u '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "- **Tamanho do Lote:** ${{ inputs.lote_size }}" >> $GITHUB_STEP_SUMMARY
             echo "- **Cloudflare WARP:** ${{ inputs.use_warp }}" >> $GITHUB_STEP_SUMMARY
           else
             echo "- **Limite de Itens:** TODOS (execução agendada)" >> $GITHUB_STEP_SUMMARY
             echo "- **Tamanho do Lote:** 5" >> $GITHUB_STEP_SUMMARY
             echo "- **Cloudflare WARP:** ✅ Habilitado" >> $GITHUB_STEP_SUMMARY
           fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🌐 Variáveis de Ambiente (Debug):" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
           
