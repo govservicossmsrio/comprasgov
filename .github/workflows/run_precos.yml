@@ -78,10 +78,35 @@ jobs:
       - name: 6. Criar pasta de logs
         run: mkdir -p logs
 
+      - name: 6.5. Debug - Verificar variáveis de ambiente
+        run: |
+          echo "=========================================="
+          echo "DEBUG: VARIÁVEIS DE AMBIENTE"
+          echo "=========================================="
+          echo "Event name: ${{ github.event_name }}"
+          echo "Use WARP input: ${{ inputs.use_warp }}"
+          echo "LIMITE_ITENS: '${{ inputs.limite_itens }}'"
+          echo "LOTE_SIZE: '${{ inputs.lote_size }}'"
+          
+          # Calcular USE_CLOUDFLARE_WARP
+          if [ "${{ github.event_name }}" == "schedule" ]; then
+            echo "USE_CLOUDFLARE_WARP: 'true' (schedule)"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ inputs.use_warp }}" == "true" ]; then
+            echo "USE_CLOUDFLARE_WARP: 'true' (manual com WARP)"
+          else
+            echo "USE_CLOUDFLARE_WARP: 'false' (manual sem WARP)"
+          fi
+          echo "=========================================="
+
       - name: 7. Executar script de atualização de preços
         env:
           COCKROACHDB_CONN_STRING: ${{ secrets.COCKROACHDB_CONN_STRING }}
-        run: python atualizar_precos_catalogo.py
+          LIMITE_ITENS: ${{ inputs.limite_itens }}
+          LOTE_SIZE: ${{ inputs.lote_size }}
+        run: |
+          echo "Iniciando script Python..."
+          echo "USE_CLOUDFLARE_WARP=$USE_CLOUDFLARE_WARP"
+          python atualizar_precos_catalogo.py
 
       - name: 8. Desconectar WARP
         run: |
@@ -115,11 +140,6 @@ jobs:
             echo "- **Tamanho do Lote:** 5" >> $GITHUB_STEP_SUMMARY
             echo "- **Cloudflare WARP:** ✅ Habilitado" >> $GITHUB_STEP_SUMMARY
           fi
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🌐 Variáveis de Ambiente (Debug):" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
           
