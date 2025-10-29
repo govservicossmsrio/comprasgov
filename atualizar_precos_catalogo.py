@@ -34,77 +34,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Configuração Cloudflare WARP ---
-def setup_cloudflare_warp():
-    """Configura e conecta ao Cloudflare WARP se disponível"""
-    use_warp = os.getenv('USE_CLOUDFLARE_WARP', 'false').lower() == 'true'
-    
-    if not use_warp:
-        logger.info("Cloudflare WARP desabilitado")
-        return False
-    
-    try:
-        logger.info("Verificando Cloudflare WARP...")
-        
-        # Verifica se warp-cli está instalado
-        result = subprocess.run(['which', 'warp-cli'], capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.warning("warp-cli não encontrado. Executando sem WARP.")
-            return False
-        
-        # Verifica status
-        logger.info("Verificando status do WARP...")
-        result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
-        
-        if 'Connected' not in result.stdout:
-            logger.info("Registrando WARP...")
-            subprocess.run(['warp-cli', 'register'], check=False)
-            
-            logger.info("Conectando ao WARP...")
-            subprocess.run(['warp-cli', 'connect'], check=True)
-            
-            # Aguardar conexão
-            for i in range(30):
-                time.sleep(1)
-                result = subprocess.run(['warp-cli', 'status'], capture_output=True, text=True)
-                if 'Connected' in result.stdout:
-                    logger.info("WARP conectado com sucesso!")
-                    break
-            else:
-                logger.warning("Timeout ao conectar WARP. Continuando sem WARP.")
-                return False
-        else:
-            logger.info("WARP já está conectado")
-        
-        # Verificar IP
-        try:
-            result = subprocess.run(['curl', '-s', 'https://api.ipify.org'], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                logger.info(f"IP atual: {result.stdout.strip()}")
-        except Exception as e:
-            logger.warning(f"Não foi possível verificar IP: {e}")
-        
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Erro ao configurar WARP: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Erro inesperado ao configurar WARP: {e}")
-        return False
-
-def disconnect_cloudflare_warp():
-    """Desconecta do Cloudflare WARP"""
-    try:
-        result = subprocess.run(['which', 'warp-cli'], capture_output=True, text=True)
-        if result.returncode == 0:
-            logger.info("Desconectando WARP...")
-            subprocess.run(['warp-cli', 'disconnect'], check=False)
-            logger.info("WARP desconectado")
-    except Exception as e:
-        logger.warning(f"Erro ao desconectar WARP: {e}")
-
 # --- Carrega e Valida Variáveis de Ambiente ---
 print("\n" + "="*80)
 print("CARREGANDO CONFIGURAÇÕES")
@@ -139,12 +68,12 @@ else:
 print("="*80 + "\n")
 
 # --- Configurações ---
-LOTE_SIZE = int(os.getenv('LOTE_SIZE', '5'))
+LOTE_SIZE = int(os.getenv('LOTE_SIZE', '1'))
 TIMEOUT_LOTE = 300.0
 TIMEOUT_TOTAL = 120
 TIMEOUT_CONNECT = 30
 TIMEOUT_READ = 90
-MAX_RETRIES = 5
+MAX_RETRIES = 3
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -704,7 +633,6 @@ if __name__ == "__main__":
     print("="*80)
     print(f"Limite de itens: {'TODOS' if LIMITE_ITENS is None else LIMITE_ITENS}")
     print(f"Tamanho do lote: {LOTE_SIZE}")
-    print(f"Cloudflare WARP: {'HABILITADO' if os.getenv('USE_CLOUDFLARE_WARP', 'false').lower() == 'true' else 'DESABILITADO'}")
-    print("="*80 + "\n")
+        print("="*80 + "\n")
     
     asyncio.run(main(limite_itens=LIMITE_ITENS))
