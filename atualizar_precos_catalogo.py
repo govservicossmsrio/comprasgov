@@ -129,7 +129,7 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
 
             logger.info(f"Processando item {codigo_item} com {len(precos_api)} preços da API...")
             
-            # DEBUG: Mostra as colunas do primeiro registro apenas (sem printar todos os dados)
+            # DEBUG: Mostra as colunas do primeiro registro apenas
             if precos_api:
                 colunas = list(precos_api[0].keys())
                 logger.info(f"DEBUG - Total de colunas: {len(colunas)}, Primeiras 10: {colunas[:10]}")
@@ -171,7 +171,7 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     
                     chave_api = f"{id_compra_api}-{ni_fornecedor_api}"
                     
-                    # Busca valor unitário com múltiplas variações
+                    # Busca valor unitário
                     valor_unitario_str = (
                         p.get('preco_unitario') or
                         p.get('valor_unitario_homologado') or 
@@ -216,7 +216,7 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                     
                     dados_insert = []
                     for p in precos_para_inserir:
-                        # Busca campos com múltiplas variações
+                        # Busca e converte campos
                         descricao = p.get('descricao_item') or p.get('descricao_item_catalogo') or p.get('descricao') or None
                         
                         unidade = (
@@ -228,8 +228,11 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                             None
                         )
                         
-                        quantidade = p.get('quantidade') or p.get('quantidade_item') or None
+                        # CORREÇÃO CRÍTICA: Converte quantidade para float
+                        quantidade_str = p.get('quantidade') or p.get('quantidade_item') or None
+                        quantidade = converter_valor_brasileiro(quantidade_str)
                         
+                        # Converte valor unitário
                         valor_unitario_str = (
                             p.get('preco_unitario') or
                             p.get('valor_unitario_homologado') or 
@@ -239,13 +242,14 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         )
                         valor_unitario = converter_valor_brasileiro(valor_unitario_str)
                         
-                        # Calcula valor total se não existir
-                        valor_total = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
-                        if valor_total:
-                            valor_total = converter_valor_brasileiro(valor_total)
-                        elif valor_unitario and quantidade:
+                        # Calcula ou converte valor total
+                        valor_total_str = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
+                        valor_total = converter_valor_brasileiro(valor_total_str)
+                        
+                        # Se não tem valor total mas tem unitário e quantidade, calcula
+                        if valor_total is None and valor_unitario is not None and quantidade is not None:
                             try:
-                                valor_total = valor_unitario * float(quantidade)
+                                valor_total = valor_unitario * quantidade
                             except (ValueError, TypeError):
                                 valor_total = None
                         
@@ -284,9 +288,9 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                             tipo_item,
                             descricao,
                             unidade,
-                            quantidade,
-                            valor_unitario,
-                            valor_total,
+                            quantidade,  # Agora é float ou None
+                            valor_unitario,  # Já é float ou None
+                            valor_total,  # Já é float ou None
                             cnpj,
                             nome_fornecedor,
                             numero_compra,
@@ -323,8 +327,11 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                             None
                         )
                         
-                        quantidade = p.get('quantidade') or p.get('quantidade_item') or None
+                        # CORREÇÃO CRÍTICA: Converte quantidade
+                        quantidade_str = p.get('quantidade') or p.get('quantidade_item') or None
+                        quantidade = converter_valor_brasileiro(quantidade_str)
                         
+                        # Converte valor unitário
                         valor_unitario_str = (
                             p.get('preco_unitario') or
                             p.get('valor_unitario_homologado') or 
@@ -334,12 +341,13 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         )
                         valor_unitario = converter_valor_brasileiro(valor_unitario_str)
                         
-                        valor_total = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
-                        if valor_total:
-                            valor_total = converter_valor_brasileiro(valor_total)
-                        elif valor_unitario and quantidade:
+                        # Converte valor total
+                        valor_total_str = p.get('valor_total_homologado') or p.get('valor_total') or p.get('preco_total') or None
+                        valor_total = converter_valor_brasileiro(valor_total_str)
+                        
+                        if valor_total is None and valor_unitario is not None and quantidade is not None:
                             try:
-                                valor_total = valor_unitario * float(quantidade)
+                                valor_total = valor_unitario * quantidade
                             except (ValueError, TypeError):
                                 valor_total = None
                         
@@ -376,9 +384,9 @@ def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> 
                         dados_update.append((
                             descricao,
                             unidade,
-                            quantidade,
-                            valor_unitario,
-                            valor_total,
+                            quantidade,  # Agora é float ou None
+                            valor_unitario,  # Já é float ou None
+                            valor_total,  # Já é float ou None
                             nome_fornecedor,
                             data_resultado,
                             codigo_item,
