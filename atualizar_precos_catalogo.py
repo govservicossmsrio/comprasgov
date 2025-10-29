@@ -13,7 +13,7 @@ import re
 from charset_normalizer import from_bytes
 from ftfy import fix_text
 
-# --- Configuração (Ajustada conforme sua solicitação) ---
+# --- Configuração ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv(dotenv_path='dbconnection.env')
 
@@ -65,10 +65,10 @@ def get_itens_para_processar(conn) -> Dict[str, Dict]:
         logging.info(f"Encontrados {len(itens_para_processar)} itens únicos para verificar.")
         return itens_para_processar
 
-# --- CORREÇÃO DEFINITIVA DA LÓGICA DE INSERÇÃO ---
 def sync_lote_precos_catalogo(conn_string: str, resultados_lote: List[Dict]) -> Tuple[int, int, int]:
     total_novos, total_atualizados, total_erros_db = 0, 0, 0
     
+    # Itera sobre cada resultado e abre uma conexão/transação para cada um
     for resultado in resultados_lote:
         conn = None
         try:
@@ -169,7 +169,7 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
                 if df_page.empty: break
                 all_dfs.append(df_page)
                 current_page += 1
-                await asyncio.sleep(0.5) # Pequena pausa para não sobrecarregar
+                await asyncio.sleep(0.5)
         except Exception as e:
             logging.error(f"Erro de rede/processamento para item {codigo_item}: {e}", exc_info=False)
             sucesso_coleta = False
@@ -194,13 +194,15 @@ async def fetch_precos_item(session: aiohttp.ClientSession, codigo_item: str, ti
         'sucesso': sucesso_coleta
     }
 
-# --- Orquestração Principal (com Lógica de Retentativa Final) ---
+# --- Orquestração Principal (Lógica de Retentativa Simplificada e Corrigida) ---
 
-async def processar_lotes(session, itens_para_processar_lista, stats):
+async def processar_e_salvar_lotes(session, itens_para_processar_lista, stats):
     itens_falhados = []
+    total_lotes = (len(itens_para_processar_lista) + LOTE_SIZE - 1) // LOTE_SIZE
+    
     for i in range(0, len(itens_para_processar_lista), LOTE_SIZE):
         lote_atual = itens_para_processar_lista[i:i + LOTE_SIZE]
-        logging.info(f"\n--- Processando Lote {i//LOTE_SIZE + 1}/{(len(itens_para_processar_lista) + LOTE_SIZE - 1)//LOTE_SIZE} ---\n")
+        logging.info(f"\n--- Processando Lote {i//LOTE_SIZE + 1}/{total_lotes} ---\n")
 
         tasks = {asyncio.create_task(fetch_precos_item(session, codigo, detalhes['tipo'], detalhes['ultima_data']), name=f"Item-{codigo}") for codigo, detalhes in lote_atual}
         
@@ -208,20 +210,26 @@ async def processar_lotes(session, itens_para_processar_lista, stats):
         
         resultados_coleta = []
         if done:
-            resultados_coleta.extend([task.result() for task in done])
+            for task in done:
+                try:
+                    resultados_coleta.append(task.result())
+                except Exception as e:
+                    logging.error(f"Erro ao obter resultado da tarefa {task.get_name()}: {e}")
 
         if pending:
-            logging.warning(f"{len(pending)} tarefa(s) não concluída(s) dentro do timeout de {TIMEOUT_LOTE}s. Serão reprocessadas no final.")
+            logging.warning(f"{len(pending)} tarefa(s) não concluída(s) dentro do timeout de {TIMEOUT_LOTE}s.")
             for task in pending:
+                logging.warning(f"  - Tarefa pendente: {task.get_name()}")
                 task.cancel()
 
-        # Identifica falhas para a retentativa
-        codigos_sucesso = {res['codigo'] for res in resultados_coleta if res['sucesso']}
+        codigos_sucesso_coleta = {res['codigo'] for res in resultados_coleta if res['sucesso']}
         for codigo, detalhes in lote_atual:
-            if codigo not in codigos_sucesso:
+            if codigo not in codigos_sucesso_coleta:
                 itens_falhados.append((codigo, detalhes))
 
         resultados_validos = [res for res in resultados_coleta if res and res['sucesso']]
+        
+        # >>>>> A CHAMADA CRÍTICA QUE FALTAVA <<<<<
         if resultados_validos:
             novos, atualizados, erros_db = sync_lote_precos_catalogo(CONN_STRING, resultados_validos)
             stats['precos_novos'] += novos
@@ -247,15 +255,13 @@ async def main():
     itens_lista = list(itens_para_processar.items())
 
     async with aiohttp.ClientSession() as session:
-        # Primeira passagem
         logging.info("=" * 20 + " INICIANDO PRIMEIRA PASSAGEM " + "=" * 20)
-        itens_falhados_passo1 = await processar_lotes(session, itens_lista, stats)
+        itens_falhados_passo1 = await processar_e_salvar_lotes(session, itens_lista, stats)
 
-        # Segunda passagem (retentativa)
         if itens_falhados_passo1:
             logging.info("=" * 20 + f" INICIANDO RETENTATIVA PARA {len(itens_falhados_passo1)} ITENS " + "=" * 20)
-            stats['itens_processados'] = 0 # Reseta contador para a segunda passagem
-            itens_falhados_passo2 = await processar_lotes(session, itens_falhados_passo1, stats)
+            stats['itens_processados'] = 0 # Zera para a contagem da retentativa
+            itens_falhados_passo2 = await processar_e_salvar_lotes(session, itens_falhados_passo1, stats)
             
             if itens_falhados_passo2:
                 logging.error("=" * 20 + " ITENS COM FALHA PERSISTENTE " + "=" * 20)
