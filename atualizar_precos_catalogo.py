@@ -68,7 +68,7 @@ else:
 print("="*80 + "\n")
 
 # --- Configurações ---
-LOTE_SIZE = int(os.getenv('LOTE_SIZE', '1'))
+LOTE_SIZE = int(os.getenv('LOTE_SIZE', '3'))
 TIMEOUT_LOTE = 300.0
 TIMEOUT_TOTAL = 120
 TIMEOUT_CONNECT = 30
