@@ -1,5 +1,3 @@
-## Coleta Manual de Dados do PNCP
-
 name: Coleta Manual de Dados do PNCP
 
 on:
@@ -7,9 +5,9 @@ on:
     inputs:
       api_type:
         description: 'Tipo de Consulta'
+        type: choice
         required: true
         default: 'ITENS'
-        type: choice
         options:
           - CONTRATACAO
           - ITENS
@@ -22,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository code
-      uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
     - name: Set up Python 3.9
       uses: actions/setup-python@v4
@@ -37,12 +35,10 @@ jobs:
 
     - name: Run Python Script
       run: |
-        API_TYPE="${{ github.event.inputs.api_type }}"
-        OUTPUT_FILE="dados-${API_TYPE}.csv"
-        python coletar_dados_pncp.py --api "$API_TYPE" --output "$OUTPUT_FILE"
+        python coletar_dados_pncp.py --api ${{ github.event.inputs.api_type }} --output dados-${{ github.event.inputs.api_type }}.csv
 
-    - name: Upload collected data as artifact
-      uses: actions/upload-artifact@v3
+    - name: Upload collected data artifact
+      uses: actions/upload-artifact@v4
       with:
         name: dados-coletados
         path: dados-${{ github.event.inputs.api_type }}.csv
