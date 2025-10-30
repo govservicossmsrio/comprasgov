@@ -1,4 +1,3 @@
-```yaml
 ## Coleta Manual de Dados do PNCP
 
 name: Coleta Manual de Dados do PNCP
@@ -47,4 +46,3 @@ jobs:
       with:
         name: dados-coletados
         path: dados-${{ github.event.inputs.api_type }}.csv
-```
