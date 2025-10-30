@@ -548,9 +548,6 @@ async def main(limite_itens: Optional[int] = None):
     logger.info("Iniciando sincronização de preços do catálogo...")
     logger.info(f"Log salvo em: {log_filename}")
     
-    # Configurar Cloudflare WARP se habilitado
-    warp_connected = setup_cloudflare_warp()
-    
     try:
         conn = get_db_connection()
         if not conn:
@@ -616,10 +613,9 @@ async def main(limite_itens: Optional[int] = None):
         logger.info(f"{'='*80}")
         logger.info(f"Log completo em: {log_filename}\n")
         
-    finally:
-        # Desconectar WARP ao finalizar
-        if warp_connected:
-            disconnect_cloudflare_warp()
+    except Exception as e:
+        logger.error(f"Ocorreu um erro fatal na execução principal: {e}")
+
 
 if __name__ == "__main__":
     LIMITE_ITENS_ENV = os.getenv('LIMITE_ITENS')
@@ -633,6 +629,6 @@ if __name__ == "__main__":
     print("="*80)
     print(f"Limite de itens: {'TODOS' if LIMITE_ITENS is None else LIMITE_ITENS}")
     print(f"Tamanho do lote: {LOTE_SIZE}")
-        print("="*80 + "\n")
+    print("="*80 + "\n")
     
     asyncio.run(main(limite_itens=LIMITE_ITENS))
