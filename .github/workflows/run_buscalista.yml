@@ -35,7 +35,7 @@ jobs:
 
     - name: Run Python Script
       run: |
-        python coletar_dados_pncp.py --api ${{ github.event.inputs.api_type }} --output dados-${{ github.event.inputs.api_type }}.csv
+        python busca_lista.py --api ${{ github.event.inputs.api_type }} --output dados-${{ github.event.inputs.api_type }}.csv
 
     - name: Upload collected data artifact
       uses: actions/upload-artifact@v4
