@@ -1,291 +1,239 @@
+## Script para Coleta de Dados do PNCP
 import asyncio
 import aiohttp
 import pandas as pd
 import argparse
 import logging
 import os
-import io
+import re
+from io import StringIO
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Limite de requisições concorrentes para evitar sobrecarregar a API
-MAX_CONCURRENT_REQUESTS = 3
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+# Configurações globais
+MAX_CONCURRENT_REQUESTS = 3 # Limite de requisições concorrentes
 
 # Mapeamento de endpoints da API
-# is_json: True para APIs que retornam JSON, False para CSV
-# param_name: Nome do parâmetro de busca (ex: 'codigo' ou 'codigoItemCatalogo')
-# record_path: Caminho para os dados reais dentro do JSON, se estiverem aninhados (usado por json_normalize)
-# meta_fields: Campos de nível superior no JSON a serem incluídos em cada linha (usado por json_normalize)
 API_ENDPOINTS = {
     "CONTRATACAO": {
         "url_base": "https://dadosabertos.compras.gov.br/modulo-contratacoes/1.1_consultarContratacoes_PNCP_14133_Id",
         "param_name": "codigo",
-        "is_json": True,
-        "record_path": ['_embedded', 'contratacoes'], # Caminho sugerido para dados aninhados
-        "meta_fields": ['total', 'pagina', 'tamanhoPagina']
+        "record_path": ["_embedded", "contratacoes"],
+        "meta": ["total", "pagina", "tamanhoPagina"]
     },
     "ITENS": {
         "url_base": "https://dadosabertos.compras.gov.br/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id",
         "param_name": "codigo",
-        "is_json": True,
-        "record_path": ['_embedded', 'itens'], # Assumindo 'itens' para esta API
-        "meta_fields": ['total', 'pagina', 'tamanhoPagina']
+        "record_path": ["_embedded", "contratacoes"], # A API de itens também retorna em 'contratacoes'
+        "meta": ["total", "pagina", "tamanhoPagina"]
     },
     "RESULTADOS": {
         "url_base": "https://dadosabertos.compras.gov.br/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id",
         "param_name": "codigo",
-        "is_json": True,
-        "record_path": ['_embedded', 'resultados'], # Assumindo 'resultados' para esta API
-        "meta_fields": ['total', 'pagina', 'tamanhoPagina']
+        "record_path": ["_embedded", "contratacoes"], # A API de resultados também retorna em 'contratacoes'
+        "meta": ["total", "pagina", "tamanhoPagina"]
     },
     "PRECOS_MATERIAL": {
         "url_base": "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV",
         "param_name": "codigoItemCatalogo",
-        "is_json": False,
-        "additional_params": "&pagina=1&tamanhoPagina=1000" # Parâmetros adicionais para CSV
+        "is_csv": True
     },
     "PRECOS_SERVICO": {
         "url_base": "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV",
         "param_name": "codigoItemCatalogo",
-        "is_json": False,
-        "additional_params": "&pagina=1&tamanhoPagina=1000"
+        "is_csv": True
     }
 }
 
-# Colunas conhecidas que podem conter valores monetários e precisam de formatação
-CURRENCY_COLUMNS = [
-    'valorEstimado', 'valorTotal', 'valorUnitarioEstimado',
-    'valorTotalLicitado', 'valorUnitario', 'precoUnitario',
-    'valorCotado'
+# Colunas para formatação monetária (com 4 casas decimais e separador ,)
+MONETARY_COLUMNS = [
+    'valorTotal', 'valorEstimado', 'valorUnitario', 'valorUnitarioEstimado',
+    'valorJulgado', 'valorHomologado', 'valorFinal', 'valorGlobal'
 ]
 
-def read_ids_from_file(filename="id_lista.txt"):
-    """Lê os IDs de um arquivo de texto, um por linha."""
-    ids = []
-    if not os.path.exists(filename):
-        logger.error(f"Erro: O arquivo '{filename}' não foi encontrado na mesma pasta. Crie-o com um ID por linha.")
-        return None
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'): # Ignora linhas vazias e comentários
-                    ids.append(line)
-        logger.info(f"Lidos {len(ids)} IDs do arquivo '{filename}'.")
-        return ids
-    except Exception as e:
-        logger.error(f"Erro ao ler o arquivo '{filename}': {e}")
-        return None
-
-async def fetch(session, url, api_type_config):
-    """Faz uma requisição HTTP GET para a URL especificada."""
-    async with semaphore: # Limita requisições concorrentes
+async def fetch_data(session, url, id_value, api_config, semaphore):
+    """
+    Realiza uma requisição HTTP GET para a URL especificada e retorna os dados.
+    """
+    async with semaphore: # Limita o número de requisições concorrentes
         try:
-            headers = {'accept': '*/*'}
-            if not api_type_config['is_json']:
-                headers = {'accept': 'text/csv'} # Para APIs que retornam CSV
+            logger.info(f"Iniciando requisição para ID: {id_value} na URL: {url}")
+            async with session.get(url, headers={'accept': '*/*'}) as response:
+                response.raise_for_status() # Lança exceção para códigos de status HTTP 4xx/5xx
 
-            async with session.get(url, headers=headers, timeout=30) as response:
-                response.raise_for_status()  # Levanta HTTPStatusError para respostas 4xx/5xx
-                if api_type_config['is_json']:
-                    return await response.json()
+                if api_config.get("is_csv"):
+                    return await response.text()
                 else:
-                    return await response.text() # Para conteúdo CSV
-        except aiohttp.ClientTimeout:
-            logger.warning(f"Timeout ao buscar {url}")
-            return None
+                    return await response.json()
         except aiohttp.ClientError as e:
-            logger.warning(f"Erro de rede/cliente ao buscar {url}: {e}")
+            logger.error(f"Erro na requisição para ID {id_value} ({url}): {e}")
             return None
         except Exception as e:
-            logger.error(f"Erro inesperado ao buscar {url}: {e}")
+            logger.error(f"Erro inesperado para ID {id_value} ({url}): {e}")
             return None
 
-async def collect_data(api_type: str, ids: list):
+def read_ids_from_file(filepath="id_lista.txt"):
     """
-    Coleta dados de uma API específica para uma lista de IDs.
-    Retorna uma lista de DataFrames (para JSON) ou strings CSV (para CSV).
+    Lê IDs de um arquivo de texto, um ID por linha.
+    Retorna uma lista de IDs válidos.
     """
-    api_config = API_ENDPOINTS.get(api_type)
-    if not api_config:
-        logger.error(f"Tipo de API '{api_type}' inválido. Escolha entre: {', '.join(API_ENDPOINTS.keys())}")
+    if not os.path.exists(filepath):
+        logger.error(f"Arquivo '{filepath}' não encontrado. Crie um arquivo com IDs, um por linha.")
         return []
 
-    logger.info(f"Iniciando coleta de dados para a API: {api_type}")
-    base_url = api_config['url_base']
-    param_name = api_config['param_name']
-    is_json = api_config['is_json']
-    additional_params = api_config.get('additional_params', '')
+    ids = []
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                stripped_id = line.strip()
+                if stripped_id and stripped_id.isdigit(): # Garante que o ID não está vazio e é numérico
+                    ids.append(stripped_id)
+                elif stripped_id:
+                    logger.warning(f"Ignorando linha inválida no arquivo '{filepath}': '{line.strip()}' (não é um ID numérico válido)")
+        logger.info(f"Total de {len(ids)} IDs lidos de '{filepath}'.")
+    except Exception as e:
+        logger.error(f"Erro ao ler o arquivo '{filepath}': {e}")
+    return ids
 
-    all_results = []
+def format_monetary_columns(df):
+    """
+    Formata colunas monetárias para o padrão brasileiro (4 casas decimais, vírgula como separador).
+    """
+    if df.empty:
+        return df
+
+    for col in MONETARY_COLUMNS:
+        if col in df.columns:
+            # Tenta converter para numérico, preenchendo erros com NaN
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            # Remove NaN's para evitar erro na formatação e aplica a formatação
+            # O .fillna('') é para que valores NaN não virem 'nan' string
+            df[col] = df[col].apply(lambda x: f'{x:,.4f}'.replace('.', 'TEMP').replace(',', '.').replace('TEMP', ',') if pd.notna(x) else '')
+    return df
+
+async def collect_data(api_name, output_filename, ids_list):
+    """
+    Coleta dados da API especificada e salva em um arquivo CSV.
+    """
+    if api_name not in API_ENDPOINTS:
+        logger.error(f"Tipo de API '{api_name}' inválido. Opções válidas: {list(API_ENDPOINTS.keys())}")
+        return
+
+    api_config = API_ENDPOINTS[api_name]
+    all_dataframes = [] # Para armazenar DataFrames de JSON
+    all_csv_texts = [] # Para armazenar textos CSV
+
+    # CRÍTICO: Semaphore deve ser criado dentro do loop de eventos
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for id_value in ids:
-            if is_json:
-                url = f"{base_url}?tipo={param_name}&codigo={id_value}"
+        for id_value in ids_list:
+            # Constrói a URL para a API de contratações/itens/resultados
+            if not api_config.get("is_csv"):
+                url = f"{api_config['url_base']}?tipo=idCompra&{api_config['param_name']}={id_value}"
+            # Constrói a URL para a API de preços (material/serviço)
             else:
-                url = f"{base_url}?{param_name}={id_value}{additional_params}"
-            tasks.append(fetch(session, url, api_config))
+                # APIs de preço requerem paginação e tamanhoPagina
+                url = f"{api_config['url_base']}?pagina=1&tamanhoPagina=10&{api_config['param_name']}={id_value}"
+
+            tasks.append(fetch_data(session, url, id_value, api_config, semaphore))
 
         responses = await asyncio.gather(*tasks)
 
-        for i, response_data in enumerate(responses):
-            id_value = ids[i] # O ID correspondente a esta resposta
+        for id_value, response_data in zip(ids_list, responses):
             if response_data is None:
-                logger.warning(f"Nenhum dado retornado para ID: {id_value} da API {api_type}. Pulando.")
                 continue
 
-            if is_json:
-                df_current_id = pd.DataFrame()
-                
-                if isinstance(response_data, dict):
-                    record_path = api_config.get('record_path')
-                    meta_fields = api_config.get('meta_fields', [])
-                    
-                    # Tenta normalizar com record_path se ele existir no dicionário
-                    if record_path and len(record_path) > 0:
-                        try:
-                            # Tenta com o record_path especificado
-                            # json_normalize pode falhar se o path não existir ou não for uma lista/dict
-                            nested_data = response_data
-                            for key in record_path:
-                                nested_data = nested_data[key]
-                            
-                            df_current_id = pd.json_normalize(nested_data, meta=meta_fields)
-                        except KeyError:
-                            logger.debug(f"Record_path '{record_path}' não encontrado ou inválido para ID {id_value}. Tentando normalizar o objeto raiz.")
-                            # Fallback: tentar normalizar o dict raiz diretamente
-                            df_current_id = pd.json_normalize(response_data)
-                        except Exception as e:
-                            logger.warning(f"Erro na normalização JSON com record_path {record_path} para ID {id_value}: {e}. Tentando normalizar o objeto raiz.")
-                            df_current_id = pd.json_normalize(response_data)
+            if api_config.get("is_csv"):
+                all_csv_texts.append(response_data)
+            else:
+                try:
+                    # Normalização profunda: entra em '_embedded.contratacoes'
+                    df_temp = pd.json_normalize(
+                        response_data,
+                        record_path=api_config['record_path'],
+                        meta=api_config['meta'],
+                        errors='ignore' # Ignora chaves que podem não existir em todos os objetos
+                    )
+                    if not df_temp.empty:
+                        all_dataframes.append(df_temp)
+                        logger.info(f"Dados do ID {id_value} processados com sucesso. {len(df_temp)} registros.")
                     else:
-                        # Se não há record_path ou ele está vazio, normaliza o dict raiz
-                        df_current_id = pd.json_normalize(response_data)
+                        logger.warning(f"Nenhum dado encontrado para ID {id_value} na estrutura esperada de {api_config['record_path']}.")
 
-                elif isinstance(response_data, list):
-                    # Se a resposta é diretamente uma lista de registros
-                    df_current_id = pd.json_normalize(response_data)
-                
-                else:
-                    logger.warning(f"Resposta JSON inesperada para ID: {id_value} da API {api_type}: {type(response_data)}. Esperado dict ou list.")
-                    continue
+                except Exception as e:
+                    logger.error(f"Erro ao normalizar dados JSON para ID {id_value}: {e}. Dados brutos: {response_data}")
 
-                if not df_current_id.empty:
-                    # Adiciona o ID original para rastreabilidade
-                    df_current_id[f'id_{param_name}_original'] = id_value
-                    all_results.append(df_current_id)
-                else:
-                    logger.info(f"Normalização JSON não retornou dados para ID: {id_value} da API {api_type} após tentar diferentes abordagens.")
-            else: # Processamento para API que retorna CSV
-                if response_data.strip(): # Verifica se o conteúdo não é vazio
-                    all_results.append(response_data)
-                else:
-                    logger.warning(f"Resposta CSV vazia para ID: {id_value} da API {api_type}.")
-    return all_results
+    # Processamento e salvamento final
+    if api_config.get("is_csv"):
+        if all_csv_texts:
+            # Junta todos os CSVs. Pega o cabeçalho do primeiro e os dados dos demais.
+            header = all_csv_texts[0].split('\n')[0]
+            combined_csv_body = [header] + [csv_text.split('\n', 1)[1] for csv_text in all_csv_texts]
+            final_csv_content = '\n'.join(combined_csv_body)
+            # Remove linhas vazias se houver
+            final_csv_content = '\n'.join(line for line in final_csv_content.splitlines() if line.strip())
 
-def format_currency_column(df_col):
-    """Formata uma coluna do DataFrame como moeda brasileira com 4 casas decimais."""
-    # Converte para numérico, forçando NaNs para valores inválidos
-    # Substitui vírgulas por pontos antes de converter para float para que o Pandas entenda
-    numeric_col = pd.to_numeric(
-        df_col.astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False),
-        errors='coerce'
-    )
-    # Aplica formatação e troca ponto por vírgula para o padrão brasileiro
-    formatted_col = numeric_col.apply(lambda x: f'{x:.4f}'.replace('.', ',') if pd.notna(x) else '')
-    return formatted_col
+            with open(output_filename, 'w', encoding='utf-8-sig') as f:
+                f.write(final_csv_content)
+            logger.info(f"Dados CSV combinados salvos em '{output_filename}'")
+        else:
+            logger.warning("Nenhum dado CSV foi coletado.")
+    else:
+        if all_dataframes:
+            df_final = pd.concat(all_dataframes, ignore_index=True)
+
+            # Formata colunas monetárias
+            df_final = format_monetary_columns(df_final)
+
+            # Remove colunas indesejadas que podem vir do metadata da API e não são úteis no CSV
+            columns_to_drop = [col for col in ['_links.self.href', '_links.next.href', '_links.last.href'] if col in df_final.columns]
+            if columns_to_drop:
+                df_final = df_final.drop(columns=columns_to_drop)
+
+            # Reordena colunas para colocar os IDs e nomes no início, se existirem
+            preferred_order_start = [
+                'idCompra', 'idContratacao', 'identificadorPNCP', 'numeroContrato',
+                'nomeContratado', 'cnpjContratado', 'cpfContratado',
+                'objeto', 'nomeOrgao', 'codigoOrgao'
+            ]
+            current_columns = df_final.columns.tolist()
+            new_order = [col for col in preferred_order_start if col in current_columns and col not in columns_to_drop]
+            remaining_columns = [col for col in current_columns if col not in new_order and col not in columns_to_drop]
+            df_final = df_final[new_order + remaining_columns]
+
+
+            df_final.to_csv(output_filename, index=False, encoding='utf-8-sig', sep=';')
+            logger.info(f"Dados JSON normalizados e formatados salvos em '{output_filename}'")
+        else:
+            logger.warning("Nenhum DataFrame foi gerado a partir dos dados JSON.")
 
 async def main():
-    parser = argparse.ArgumentParser(description="Coleta dados do PNCP de forma assíncrona e salva em CSV.")
-    parser.add_argument('--api', type=str, required=True,
-                        choices=API_ENDPOINTS.keys(),
-                        help="Tipo de API para consultar.")
-    parser.add_argument('--output', type=str, required=True,
-                        help="Nome do arquivo de saída CSV (ex: dados.csv).")
+    parser = argparse.ArgumentParser(description="Coletar dados do PNCP para uma lista de IDs.")
+    parser.add_argument("--api", required=True, choices=list(API_ENDPOINTS.keys()),
+                        help="Tipo de API a ser consultada (CONTRATACAO, ITENS, RESULTADOS, PRECOS_MATERIAL, PRECOS_SERVICO)")
+    parser.add_argument("--output", required=True, help="Nome do arquivo de saída (ex: dados.csv)")
     args = parser.parse_args()
 
-    # Leitura dos IDs do arquivo
-    ids_to_process = read_ids_from_file()
-    if not ids_to_process:
-        logger.error("Nenhum ID válido para processar. Encerrando.")
+    ids = read_ids_from_file()
+    if not ids:
+        logger.error("Nenhum ID válido encontrado para processamento. Encerrando.")
         return
 
-    # Coleta dos dados
-    results = await collect_data(args.api, ids_to_process)
-
-    if not results:
-        logger.info("Nenhum dado coletado para salvar.")
-        return
-
-    api_config = API_ENDPOINTS[args.api]
-
-    if api_config['is_json']:
-        # Concatena todos os DataFrames JSON
-        try:
-            df_final = pd.concat(results, ignore_index=True)
-            logger.info(f"Dados JSON compilados em um DataFrame com {len(df_final)} linhas e {len(df_final.columns)} colunas.")
-        except ValueError as e:
-            logger.error(f"Erro ao concatenar DataFrames JSON: {e}. Verifique se todos os DataFrames têm estruturas compatíveis.")
-            logger.info("Tentando concatenar de forma mais flexível.")
-            
-            # Fallback para concatenação flexível, caso as colunas variem muito entre os resultados
-            df_final = pd.DataFrame()
-            if results:
-                # Inicializa com o primeiro DataFrame para pegar um conjunto inicial de colunas
-                df_final = results[0]
-                for i in range(1, len(results)):
-                    df_final = pd.concat([df_final, results[i]], ignore_index=True, sort=False)
-            
-            if df_final.empty:
-                logger.error("DataFrame final JSON vazio após tentativas de concatenação. Encerrando.")
-                return
-        
-        # Formatação de colunas de moeda
-        for col in CURRENCY_COLUMNS:
-            if col in df_final.columns:
-                logger.info(f"Formatando coluna '{col}' como moeda.")
-                df_final[col] = format_currency_column(df_final[col])
-            else:
-                logger.debug(f"Coluna '{col}' não encontrada no DataFrame final.")
-
-        # Salva o DataFrame final em CSV com separador ';' e encoding utf-8-sig para Excel
-        try:
-            df_final.to_csv(args.output, index=False, encoding='utf-8-sig', sep=';')
-            logger.info(f"Dados JSON salvos com sucesso em '{args.output}'.")
-        except Exception as e:
-            logger.error(f"Erro ao salvar o arquivo CSV para dados JSON: {e}")
-
-    else: # Processamento para APIs que retornam CSV diretamente
-        # Concatena os conteúdos CSV, garantindo que o cabeçalho seja escrito apenas uma vez
-        full_csv_content = []
-        header_written = False
-        for csv_text in results:
-            lines = csv_text.strip().split('\n')
-            if not lines:
-                continue
-
-            if not header_written:
-                full_csv_content.append(lines[0]) # Adiciona o cabeçalho do primeiro CSV
-                header_written = True
-                full_csv_content.extend(lines[1:]) # Adiciona os dados
-            else:
-                full_csv_content.extend(lines[1:]) # Adiciona os dados, pulando cabeçalhos subsequentes
-
-        if not full_csv_content:
-            logger.info("Nenhum conteúdo CSV para salvar.")
-            return
-
-        try:
-            # Salva o conteúdo CSV bruto
-            with open(args.output, 'w', encoding='utf-8-sig', newline='') as f:
-                f.write('\n'.join(full_csv_content))
-            logger.info(f"Dados CSV salvos com sucesso em '{args.output}'.")
-        except Exception as e:
-            logger.error(f"Erro ao salvar o arquivo CSV para dados diretos de CSV: {e}")
+    logger.info(f"Iniciando coleta para a API: {args.api}")
+    await collect_data(args.api, args.output, ids)
+    logger.info("Coleta de dados concluída.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Garante que o loop de eventos seja fechado corretamente
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        logger.critical(f"Erro de execução: {e}. Isso pode ocorrer se o loop de eventos estiver sendo gerenciado incorretamente. Certifique-se de que o programa não está tentando criar um novo loop ou usar um loop já fechado.")
+    except KeyboardInterrupt:
+        logger.info("Processo interrompido pelo usuário.")
+    except Exception as e:
+        logger.critical(f"Erro inesperado no programa principal: {e}", exc_info=True)
