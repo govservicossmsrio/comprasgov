@@ -100,7 +100,7 @@ async def main(api_name, output_filename):
 
     all_data = []
     # Limita o número de requisições concorrentes
-    semaphore = asyncio.Semaphore(5) 
+    semaphore = asyncio.Semaphore(3) 
 
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_data(session, api_config, item_id, semaphore) for item_id in ids]
