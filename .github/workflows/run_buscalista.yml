@@ -1,0 +1,50 @@
+```yaml
+## Coleta Manual de Dados do PNCP
+
+name: Coleta Manual de Dados do PNCP
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_type:
+        description: 'Tipo de Consulta'
+        required: true
+        default: 'ITENS'
+        type: choice
+        options:
+          - CONTRATACAO
+          - ITENS
+          - RESULTADOS
+          - PRECOS_MATERIAL
+          - PRECOS_SERVICO
+
+jobs:
+  collect-data:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository code
+      uses: actions/checkout@v3
+
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pandas aiohttp
+
+    - name: Run Python Script
+      run: |
+        API_TYPE="${{ github.event.inputs.api_type }}"
+        OUTPUT_FILE="dados-${API_TYPE}.csv"
+        python coletar_dados_pncp.py --api "$API_TYPE" --output "$OUTPUT_FILE"
+
+    - name: Upload collected data as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: dados-coletados
+        path: dados-${{ github.event.inputs.api_type }}.csv
+```
