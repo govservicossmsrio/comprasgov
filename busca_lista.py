@@ -1,267 +1,252 @@
-## coletar_dados_pncp.py
 import asyncio
 import aiohttp
-import pandas as pd
 import argparse
+import pandas as pd
 import logging
 import os
+import re
 
-# Configuração de logging
+# Configuração do logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Configurações ---
-MAX_CONCURRENT_REQUESTS = 3  # Limite de requisições concorrentes
+# Limite de requisições concorrentes
+MAX_CONCURRENT_REQUESTS = 3
 
-# Colunas que podem conter valores monetários para formatação
-MONEY_COLUMNS = [
-    'valorUnitario', 'valorTotal', 'valorEstimado', 'valorUnitarioEstimado',
-    'valorTotalHomologado', 'valorUnitarioHomologado', 'valorSubscrito',
-    'valorOriginal', 'valorNegociado', 'valorAtualizado', 'valorItem'
-]
-
-# Mapeamento dos endpoints da API
+# Mapeamento de endpoints da API
 API_ENDPOINTS = {
     'CONTRATACAO': {
-        'url': 'https://dadosabertos.compras.gov.br/modulo-contratacoes/1.1_consultarContratacoes_PNCP_14133_Id',
-        'id_param': 'codigo',
-        'type_param': 'tipo=idCompra',
-        'response_type': 'json'
+        'url_base': 'https://dadosabertos.compras.gov.br/modulo-contratacoes/1.1_consultarContratacoes_PNCP_14133_Id',
+        'param': 'codigo',
+        'is_json': True
     },
     'ITENS': {
-        'url': 'https://dadosabertos.compras.gov.br/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id',
-        'id_param': 'codigo',
-        'type_param': 'tipo=idCompra',
-        'response_type': 'json'
+        'url_base': 'https://dadosabertos.compras.gov.br/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id',
+        'param': 'codigo',
+        'is_json': True
     },
     'RESULTADOS': {
-        'url': 'https://dadosabertos.compras.gov.br/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id',
-        'id_param': 'codigo',
-        'type_param': 'tipo=idCompra',
-        'response_type': 'json'
+        'url_base': 'https://dadosabertos.compras.gov.br/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id',
+        'param': 'codigo',
+        'is_json': True
     },
     'PRECOS_MATERIAL': {
-        'url': 'https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV',
-        'id_param': 'codigoItemCatalogo',
-        'type_param': 'pagina=1&tamanhoPagina=10', # Página e tamanho padrão, pode ser ajustado
-        'response_type': 'csv'
+        'url_base': 'https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV',
+        'param': 'codigoItemCatalogo',
+        'is_json': False
     },
     'PRECOS_SERVICO': {
-        'url': 'https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV',
-        'id_param': 'codigoItemCatalogo',
-        'type_param': 'pagina=1&tamanhoPagina=10', # Página e tamanho padrão, pode ser ajustado
-        'response_type': 'csv'
-    },
+        'url_base': 'https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV',
+        'param': 'codigoItemCatalogo',
+        'is_json': False
+    }
 }
 
-async def fetch(session, url, id_val, semaphore):
+async def fetch(session, url, item_id, semaphore):
     """
-    Realiza uma requisição HTTP assíncrona para a URL fornecida.
-    Limita requisições concorrentes usando um semáforo.
+    Realiza uma requisição HTTP GET assíncrona.
     """
     async with semaphore:  # Limita requisições concorrentes
-        logger.info(f"Iniciando requisição para ID: {id_val} na URL: {url}")
         try:
-            async with session.get(url, raise_for_status=True) as response:
-                if response.status == 200:
-                    if 'csv' in response.headers.get('Content-Type', ''):
-                        return await response.text(), id_val, 'csv'
-                    return await response.json(), id_val, 'json'
-                else:
-                    logger.error(f"Erro HTTP {response.status} para ID {id_val} na URL: {url}")
-                    return None, id_val, None
+            logger.info(f"Iniciando requisição para ID: {item_id} na URL: {url}")
+            async with session.get(url, timeout=30) as response:
+                response.raise_for_status()  # Lança exceção para status HTTP de erro
+                if response.content_type == 'application/json':
+                    return item_id, await response.json()
+                else: # Assume CSV ou texto plano
+                    return item_id, await response.text()
         except aiohttp.ClientError as e:
-            logger.error(f"Erro de conexão para ID {id_val} na URL {url}: {e}")
-            return None, id_val, None
+            logger.error(f"Erro na requisição para ID {item_id} na URL {url}: {e}")
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout na requisição para ID {item_id} na URL {url}.")
         except Exception as e:
-            logger.error(f"Erro inesperado para ID {id_val} na URL {url}: {e}")
-            return None, id_val, None
+            logger.error(f"Erro inesperado ao buscar dados para ID {item_id} na URL {url}: {e}")
+        return item_id, None
 
-async def process_json_response(json_data, api_type, id_val):
+def read_ids_from_file(filepath):
     """
-    Processa uma resposta JSON, normalizando-a para um DataFrame do pandas.
-    Assume que os dados de interesse estão na chave 'resultado'.
+    Lê IDs de um arquivo de texto, um por linha.
+    Ignora linhas vazias ou inválidas.
     """
-    if not json_data:
-        return pd.DataFrame()
-
+    ids = []
     try:
-        # Direciona a normalização para a chave 'resultado'
-        # Assume que 'resultado' contém uma lista de dicionários ou um único dicionário
-        data_to_normalize = json_data.get('resultado')
-
-        if data_to_normalize is None:
-            logger.error(f"ID {id_val}: Chave 'resultado' não encontrada nos dados JSON. Dados brutos: {json_data}")
-            return pd.DataFrame()
-
-        # Se 'resultado' for um único dicionário, envolve-o em uma lista para json_normalize
-        if isinstance(data_to_normalize, dict):
-            data_to_normalize = [data_to_normalize]
-
-        if data_to_normalize:
-            df = pd.json_normalize(data_to_normalize)
-            # Adiciona o ID original da compra para rastreamento, se ainda não estiver presente
-            if 'idCompra' not in df.columns and api_type in ['CONTRATACAO', 'ITENS', 'RESULTADOS']:
-                df['idCompra_original'] = id_val
-            return df
-        else:
-            logger.info(f"ID {id_val}: Chave 'resultado' encontrada, mas está vazia. Ignorando.")
-            return pd.DataFrame()
-
-    except KeyError as e:
-        logger.error(f"ID {id_val}: Erro ao acessar chave esperada nos dados JSON: {e}. Dados brutos: {json_data}")
-        return pd.DataFrame()
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                item_id = line.strip()
+                if item_id:  # Ignora linhas em branco
+                    ids.append(item_id)
+        logger.info(f"Lidos {len(ids)} IDs do arquivo '{filepath}'.")
+    except FileNotFoundError:
+        logger.error(f"Erro: O arquivo '{filepath}' não foi encontrado.")
+        raise
     except Exception as e:
-        logger.error(f"Erro inesperado ao normalizar dados JSON para ID {id_val}: {e}. Dados brutos: {json_data}")
-        return pd.DataFrame()
-
+        logger.error(f"Erro ao ler IDs do arquivo '{filepath}': {e}")
+        raise
+    return ids
 
 def format_money_columns(df):
     """
-    Formata colunas identificadas como monetárias para o padrão brasileiro (4 casas decimais).
+    Formata colunas que provavelmente contêm valores monetários para o padrão brasileiro
+    com 4 casas decimais e vírgula como separador decimal.
+    Converte para numérico antes de formatar e trata valores nulos.
     """
-    for col in MONEY_COLUMNS:
-        if col in df.columns:
-            # Converte para numérico, forçando erros para NaN para evitar quebrar o script
+    money_cols_patterns = [
+        'valorEstimado', 'valorTotal', 'valorUnitarioEstimado',
+        'valorHomologado', 'valorUnitarioHomologado', 'valorTotalHomologado',
+        'valorUnitarioResultado', 'valorTotalResultado', 'valorMensalEstimado',
+        'valor', 'vlr'
+    ]
+    
+    # Criar um regex que combine todos os padrões para busca de colunas
+    money_cols_regex = re.compile(r'|'.join(money_cols_patterns), re.IGNORECASE)
+
+    for col in df.columns:
+        if money_cols_regex.search(col):
+            # Converte a coluna para numérico, transformando erros em NaN
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            # Formata para string no padrão brasileiro com 4 casas decimais
+            
+            # Aplica a formatação condicionalmente para valores não nulos
             df[col] = df[col].apply(
-                lambda x: f'{x:,.4f}'.replace(',', 'X').replace('.', ',').replace('X', '.') if pd.notna(x) else None
-            )
-            # Reverte a ordem dos separadores de milhar e decimal
-            # Ex: 1234.5678 -> 1.234,5678
-            #    f'{x:.4f}'.replace('.', ',') # This would give 1234,5678 (wrong for BRL thousands)
-            #    A better way is:
-            #    df[col] = df[col].apply(lambda x: f'{x:_.4f}'.replace('.', ',').replace('_', '.') if pd.notna(x) else None)
-            # This is more complex, the current implementation with replace works for `f'{x:.4f}'` output.
-            # Let's adjust for a more standard BRL currency formatting
-            df[col] = df[col].apply(
-                lambda x: f"{x:,.4f}".replace(",", "TEMP_SEP").replace(".", ",").replace("TEMP_SEP", ".")
+                lambda x: f"{x:,.4f}".replace(",", "TEMP_SEP").replace(".", ",").replace("TEMP_SEP", ".") 
                 if pd.notna(x) else None
             )
     return df
 
-
 async def collect_data(api_name, ids_to_process, semaphore):
     """
-    Coleta dados da API para uma lista de IDs, processando JSON ou CSV.
+    Coleta dados da API especificada para uma lista de IDs.
     """
-    api_info = API_ENDPOINTS.get(api_name)
-    if not api_info:
+    endpoint_info = API_ENDPOINTS.get(api_name)
+    if not endpoint_info:
         logger.error(f"API '{api_name}' não reconhecida.")
-        return pd.DataFrame()
+        return None
 
-    base_url = api_info['url']
-    id_param = api_info['id_param']
-    type_param = api_info['type_param']
-    response_type = api_info['response_type']
+    url_base = endpoint_info['url_base']
+    param_name = endpoint_info['param']
+    is_json = endpoint_info['is_json']
 
     all_dfs = []
     all_csv_texts = []
+    header_written = False # Para APIs CSV, garante que o cabeçalho seja escrito apenas uma vez
 
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for id_val in ids_to_process:
-            url = f"{base_url}?{type_param}&{id_param}={id_val}"
-            tasks.append(fetch(session, url, id_val, semaphore))
+        for item_id in ids_to_process:
+            url = f"{url_base}?{param_name}={item_id}"
+            if is_json:
+                tasks.append(fetch(session, url, item_id, semaphore))
+            else: # Para APIs que retornam CSV, o parâmetro 'tipo' é padrão 'codigoItemCatalogo'
+                # A URL já está correta, apenas garante o nome do parâmetro
+                tasks.append(fetch(session, url, item_id, semaphore))
 
-        results = await asyncio.gather(*tasks)
+        responses = await asyncio.gather(*tasks)
 
-        for json_or_text, id_val, r_type in results:
-            if json_or_text is None:
+        for item_id, data in responses:
+            if data is None:
                 continue
 
-            if r_type == 'json':
-                df = await process_json_response(json_or_text, api_name, id_val)
-                if not df.empty:
-                    all_dfs.append(df)
-            elif r_type == 'csv':
-                all_csv_texts.append(json_or_text)
-            else:
-                logger.warning(f"Tipo de resposta desconhecido para ID {id_val}.")
+            if is_json:
+                if isinstance(data, dict):
+                    # Tenta normalizar a chave 'resultado', que é o padrão observado
+                    if 'resultado' in data and isinstance(data['resultado'], list):
+                        try:
+                            df_response = pd.json_normalize(data['resultado'])
+                            all_dfs.append(df_response)
+                        except Exception as e:
+                            logger.error(f"Erro ao normalizar dados JSON para ID {item_id} (chave 'resultado'): {e}. Dados brutos (parcial): {str(data)[:500]}...")
+                    # Fallback caso a chave 'resultado' não exista (embora os exemplos indiquem que sempre existirá para estas APIs)
+                    elif 'resultado' not in data and len(data) > 0:
+                        try:
+                            df_response = pd.json_normalize(data)
+                            all_dfs.append(df_response)
+                        except Exception as e:
+                            logger.error(f"Erro ao normalizar dados JSON para ID {item_id} (raiz): {e}. Dados brutos (parcial): {str(data)[:500]}...")
+                    else:
+                        logger.warning(f"Resposta JSON para ID {item_id} não contém 'resultado' ou está vazia. Dados brutos (parcial): {str(data)[:500]}...")
+                elif isinstance(data, list) and len(data) > 0:
+                    # Se a resposta é uma lista diretamente (ex: sem 'resultado' ou '_embedded')
+                    try:
+                        df_response = pd.json_normalize(data)
+                        all_dfs.append(df_response)
+                    except Exception as e:
+                        logger.error(f"Erro ao normalizar dados JSON para ID {item_id} (lista direta): {e}. Dados brutos (parcial): {str(data)[:500]}...")
+                else:
+                    logger.warning(f"Resposta JSON para ID {item_id} não pôde ser processada como dicionário ou lista. Dados brutos: {data}")
+            else: # Processar como CSV
+                # Para APIs CSV, a resposta é o texto CSV completo
+                if not header_written:
+                    all_csv_texts.append(data)
+                    header_written = True
+                else:
+                    # Remove o cabeçalho das strings CSV subsequentes
+                    lines = data.splitlines()
+                    if len(lines) > 1:
+                        all_csv_texts.append("\n".join(lines[1:]))
 
-    if response_type == 'json':
+    if is_json:
         if all_dfs:
-            # Concatena todos os DataFrames, usando join='outer' para preservar todas as colunas
-            df_final = pd.concat(all_dfs, ignore_index=True, join='outer')
-            df_final = format_money_columns(df_final)
-            return df_final
+            # Concatena todos os DataFrames, preenchendo com NaN para colunas ausentes
+            final_df = pd.concat(all_dfs, ignore_index=True, join='outer')
+            final_df = format_money_columns(final_df) # Formata as colunas monetárias
+            return final_df
         else:
             logger.warning("Nenhum DataFrame foi gerado a partir dos dados JSON.")
-            return pd.DataFrame() # Retorna um DataFrame vazio
-    elif response_type == 'csv':
+            return None
+    else: # Retornar texto CSV concatenado
         if all_csv_texts:
-            # Para CSVs, concatena o texto, mantendo apenas o cabeçalho do primeiro
-            combined_csv_content = []
-            for i, csv_text in enumerate(all_csv_texts):
-                lines = csv_text.strip().split('\n')
-                if i == 0:
-                    combined_csv_content.extend(lines) # Adiciona cabeçalho e dados
-                else:
-                    combined_csv_content.extend(lines[1:]) # Adiciona apenas dados
-            return "\n".join(combined_csv_content)
+            return "\n".join(all_csv_texts)
         else:
-            logger.warning("Nenhum conteúdo CSV foi gerado.")
-            return ""
-    return pd.DataFrame() # Fallback
-
-def read_ids_from_file(filename="id_lista.txt"):
-    """Lê IDs de um arquivo de texto, um ID por linha."""
-    if not os.path.exists(filename):
-        logger.error(f"Arquivo '{filename}' não encontrado. Por favor, crie-o com os IDs desejados (um por linha).")
-        return []
-
-    ids = []
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            for line in f:
-                stripped_line = line.strip()
-                if stripped_line:  # Ignora linhas vazias
-                    ids.append(stripped_line)
-        logger.info(f"Lidos {len(ids)} IDs do arquivo '{filename}'.")
-    except Exception as e:
-        logger.error(f"Erro ao ler IDs do arquivo '{filename}': {e}")
-    return ids
+            logger.warning("Nenhum texto CSV foi coletado.")
+            return None
 
 async def main():
-    """Função principal para parsear argumentos, coletar dados e salvar."""
-    parser = argparse.ArgumentParser(description="Coleta dados do PNCP para IDs específicos.")
-    parser.add_argument(
-        "--api",
-        type=str,
-        required=True,
-        choices=API_ENDPOINTS.keys(),
-        help=f"Tipo de API a ser consultada. Opções: {', '.join(API_ENDPOINTS.keys())}"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        required=True,
-        help="Nome do arquivo de saída (ex: dados.csv)"
-    )
+    parser = argparse.ArgumentParser(description="Coleta dados do PNCP.")
+    parser.add_argument('--api', type=str, required=True,
+                        choices=['CONTRATACAO', 'ITENS', 'RESULTADOS', 'PRECOS_MATERIAL', 'PRECOS_SERVICO'],
+                        help="Tipo de API a ser consultada.")
+    parser.add_argument('--output', type=str, required=True,
+                        help="Nome do arquivo de saída (ex: dados.csv).")
     args = parser.parse_args()
 
-    # Inicializa o semáforo dentro da função main, associando-o ao loop de eventos correto
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    ids_filepath = 'id_lista.txt'
+    try:
+        ids_to_process = read_ids_from_file(ids_filepath)
+    except (FileNotFoundError, Exception):
+        return
 
-    ids_to_process = read_ids_from_file()
     if not ids_to_process:
-        logger.error("Nenhum ID para processar. Encerrando.")
+        logger.warning("Nenhum ID válido para processar. Encerrando.")
         return
 
     logger.info(f"Iniciando coleta de dados para a API: {args.api}")
-    data = await collect_data(args.api, ids_to_process, semaphore)
+    
+    # O semáforo deve ser criado no mesmo loop onde será usado (aqui, dentro de main)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    
+    data_result = await collect_data(args.api, ids_to_process, semaphore)
 
-    if isinstance(data, pd.DataFrame) and not data.empty:
-        # Salva DataFrame como CSV, usando ponto e vírgula como separador e UTF-8 BOM
-        data.to_csv(args.output, index=False, sep=';', encoding='utf-8-sig')
-        logger.info(f"Dados salvos com sucesso em '{args.output}' (CSV JSON).")
-    elif isinstance(data, str) and data: # Caso seja um conteúdo CSV diretamente da API
-        with open(args.output, 'w', encoding='utf-8-sig') as f:
-            f.write(data)
-        logger.info(f"Dados salvos com sucesso em '{args.output}' (CSV API).")
+    output_filename = args.output
+
+    if data_result is not None:
+        if isinstance(data_result, pd.DataFrame):
+            try:
+                # Usa 'utf-8-sig' para melhor compatibilidade com Excel e caracteres especiais
+                # Usa ';' como separador para compatibilidade regional do Excel
+                data_result.to_csv(output_filename, index=False, encoding='utf-8-sig', sep=';')
+                logger.info(f"Dados coletados salvos em '{output_filename}' (formato DataFrame CSV).")
+            except Exception as e:
+                logger.error(f"Erro ao salvar DataFrame em '{output_filename}': {e}")
+        elif isinstance(data_result, str): # Resultado de APIs CSV
+            try:
+                with open(output_filename, 'w', encoding='utf-8-sig') as f:
+                    f.write(data_result)
+                logger.info(f"Dados coletados salvos em '{output_filename}' (formato CSV bruto).")
+            except Exception as e:
+                logger.error(f"Erro ao salvar texto CSV em '{output_filename}': {e}")
     else:
-        logger.warning(f"Nenhum dado foi coletado ou gerado para salvar no arquivo '{args.output}'.")
+        logger.warning("Nenhum dado foi coletado para salvar.")
 
-if __name__ == "__main__":
+    logger.info("Coleta de dados concluída.")
+
+if __name__ == '__main__':
     asyncio.run(main())
