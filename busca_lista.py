@@ -69,7 +69,7 @@ async def bound_fetch(sem, session, url, current_id, api_type):
     async with sem:
         return await fetch(session, url, current_id, api_type)
 
-async def collect_data(ids, api_info, max_concurrent_requests=5):
+async def collect_data(ids, api_info, max_concurrent_requests=3):
     """
     Coleta dados de múltiplas APIs de forma assíncrona.
     """
