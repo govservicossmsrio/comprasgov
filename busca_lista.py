@@ -11,15 +11,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Configurações ---
-MAX_CONCURRENT_REQUESTS = 3  # Limite de requisições concorrentes
-REQUEST_DELAY_SECONDS = 1  # Atraso em segundos entre as requisições de um mesmo worker
+# Pausas para ser "amigável" com a API
+REQUEST_SUCCESS_DELAY = 2  # Pausa de 2s após cada requisição (sucesso ou falha)
+REQUEST_ERROR_DELAY = 6    # Pausa adicional de 6s para erros específicos (400, 429, 503)
 
 # Colunas que podem conter valores monetários para formatação
 MONEY_COLUMNS = [
     'valorUnitario', 'valorTotal', 'valorEstimado', 'valorUnitarioEstimado',
     'valorTotalHomologado', 'valorUnitarioHomologado', 'valorSubscrito',
     'valorOriginal', 'valorNegociado', 'valorAtualizado', 'valorItem', 'valorTotalResultado',
-    'valorUnitarioResultado' # Adicionando esta que pode aparecer nos resultados
+    'valorUnitarioResultado'
 ]
 
 # Mapeamento dos endpoints da API
@@ -51,31 +52,37 @@ API_ENDPOINTS = {
     }
 }
 
-async def fetch(session, url, item_id, semaphore):
+async def fetch_sequentially(session, url, item_id):
     """
-    Realiza uma requisição HTTP GET assíncrona.
+    Realiza uma única requisição HTTP GET de forma sequencial.
+    Retorna o status da requisição e os dados.
     """
-    async with semaphore:
-        try:
-            logger.info(f"Iniciando requisição para ID: {item_id} na URL: {url}")
-            async with session.get(url, timeout=30) as response:
-                response.raise_for_status()
-                if 'application/json' in response.content_type:
-                    return item_id, await response.json()
-                else:
-                    return item_id, await response.text()
-        except aiohttp.ClientError as e:
-            logger.error(f"Erro na requisição para ID {item_id} na URL {url}: {e}")
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout na requisição para ID {item_id} na URL {url}.")
-        except Exception as e:
-            logger.error(f"Erro inesperado ao buscar dados para ID {item_id} na URL {url}: {e}")
-        return item_id, None
+    try:
+        logger.info(f"Iniciando requisição para ID: {item_id} na URL: {url}")
+        async with session.get(url, timeout=60) as response:
+            # Verifica se o status indica um erro que merece uma pausa maior
+            if response.status in [400, 429, 503]:
+                logger.error(f"Erro {response.status} (Bad Request/Too Many Requests/Service Unavailable) para ID {item_id}. O ID será repetido no final.")
+                return 'error_retry', None
+            
+            response.raise_for_status() # Lança exceção para outros erros HTTP (4xx, 5xx)
+            
+            if 'application/json' in response.content_type:
+                return 'success', await response.json()
+            else:
+                return 'success', await response.text()
+    except aiohttp.ClientError as e:
+        logger.error(f"Erro de cliente HTTP para ID {item_id}: {e}. O ID será repetido no final.")
+        return 'error_retry', None
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout na requisição para ID {item_id}. O ID será repetido no final.")
+        return 'error_retry', None
+    except Exception as e:
+        logger.error(f"Erro inesperado ao buscar dados para ID {item_id}: {e}. O ID será repetido no final.")
+        return 'error_retry', None
 
 def read_ids_from_file(filepath):
-    """
-    Lê IDs de um arquivo de texto, um por linha.
-    """
+    """Lê IDs de um arquivo de texto, um por linha."""
     ids = []
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -87,30 +94,22 @@ def read_ids_from_file(filepath):
     except FileNotFoundError:
         logger.error(f"Erro: O arquivo '{filepath}' não foi encontrado.")
         raise
-    except Exception as e:
-        logger.error(f"Erro ao ler IDs do arquivo '{filepath}': {e}")
-        raise
     return ids
 
 def format_money_columns(df):
-    """
-    Formata colunas monetárias para o padrão brasileiro (4 casas decimais).
-    """
+    """Formata colunas monetárias para o padrão brasileiro (4 casas decimais)."""
     for col in MONEY_COLUMNS:
         if col in df.columns:
-            # Converte a coluna para numérico, forçando erros para NaN
             df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            # Aplica a formatação condicionalmente para valores não nulos
             df[col] = df[col].apply(
                 lambda x: f"{x:,.4f}".replace(",", "TEMP_SEP").replace(".", ",").replace("TEMP_SEP", ".")
                 if pd.notna(x) else None
             )
     return df
 
-async def producer(url_queue, ids_to_process, endpoint_info):
+async def run_collection_pass(session, ids_to_process, endpoint_info, results_list, failed_ids_list):
     """
-    Gera URLs para serem processadas e as coloca na fila.
+    Executa uma passagem de coleta de dados sequencialmente para a lista de IDs fornecida.
     """
     url_base = endpoint_info['url_base']
     param_name = endpoint_info['param_name']
@@ -119,166 +118,102 @@ async def producer(url_queue, ids_to_process, endpoint_info):
     for item_id in ids_to_process:
         if is_json:
             url = f"{url_base}?tipo=idCompra&{param_name}={item_id}"
-        else: # CSV APIs, com paginação e tamanho de página maior
-            # Para CSV, vamos buscar uma página grande para reduzir o número total de requisições
-            # Nota: a API do PNCP para CSV retorna apenas uma página por requisição,
-            # sem metadados de paginação como 'totalPaginas'.
-            # A estratégia aqui é apenas aumentar o tamanho da página para cobrir a maioria dos casos.
+        else:
             url = f"{url_base}?{param_name}={item_id}&pagina=1&tamanhoPagina=1000"
         
-        await url_queue.put({'id': item_id, 'url': url, 'is_json': is_json})
+        status, data = await fetch_sequentially(session, url, item_id)
 
-async def worker(worker_id, url_queue, results, semaphore, session):
-    """
-    Processa URLs da fila, busca dados e os adiciona aos resultados.
-    """
-    while True:
-        try:
-            task = await url_queue.get()
-            item_id = task['id']
-            url = task['url']
-            is_json = task['is_json']
-
-            data = await fetch(session, url, item_id, semaphore)
-            if data is not None:
-                results.append((item_id, data[1], is_json))
-            
-            url_queue.task_done()
-            await asyncio.sleep(REQUEST_DELAY_SECONDS) # Atraso para reduzir a frequência de requisições
-
-        except asyncio.CancelledError:
-            break # Sair se a tarefa for cancelada (ao fechar o worker)
-        except Exception as e:
-            logger.error(f"Erro no worker {worker_id} ao processar ID {item_id}: {e}")
-            url_queue.task_done() # Garantir que a tarefa seja marcada como feita mesmo em caso de erro
-
-async def collect_data(api_name, ids_to_process, semaphore):
-    """
-    Coleta dados da API especificada para uma lista de IDs usando um padrão produtor-consumidor.
-    """
-    endpoint_info = API_ENDPOINTS.get(api_name)
-    if not endpoint_info:
-        logger.error(f"API '{api_name}' não reconhecida.")
-        return None
-
-    url_queue = asyncio.Queue()
-    raw_results = [] # Lista para armazenar (item_id, data, is_json)
-    
-    async with aiohttp.ClientSession() as session:
-        # Criar produtor
-        producer_task = asyncio.create_task(producer(url_queue, ids_to_process, endpoint_info))
-
-        # Criar consumidores (workers)
-        workers = []
-        for i in range(MAX_CONCURRENT_REQUESTS):
-            worker_task = asyncio.create_task(worker(i, url_queue, raw_results, semaphore, session))
-            workers.append(worker_task)
-
-        # Esperar o produtor terminar
-        await producer_task
-        # Esperar todas as tarefas da fila serem concluídas
-        await url_queue.join()
-
-        # Cancelar tarefas dos workers (para que saiam de seus loops 'while True')
-        for worker_task in workers:
-            worker_task.cancel()
-        await asyncio.gather(*workers, return_exceptions=True) # Esperar que os workers sejam cancelados
-
-    all_dfs = []
-    all_csv_texts = []
-    header_written = False
-
-    for item_id, data, is_json_flag in raw_results:
-        if data is None:
-            continue
-
-        if is_json_flag:
-            if isinstance(data, dict) and 'resultado' in data:
-                try:
-                    df_response = pd.json_normalize(data['resultado'])
-                    if not df_response.empty:
-                        # Adiciona uma coluna para o ID original, se ainda não existir
-                        if 'idCompra_original' not in df_response.columns:
-                            df_response['idCompra_original'] = item_id
-                        all_dfs.append(df_response)
-                except Exception as e:
-                    logger.error(f"Erro ao normalizar dados JSON para ID {item_id}: {e}")
-            else:
-                logger.warning(f"Resposta JSON para ID {item_id} não contém a chave 'resultado' ou não é um dicionário.")
-        else: # CSV
-            # O processamento de CSV é feito separadamente para não misturar headers
-            # Consideramos que o primeiro resultado CSV válido contém o cabeçalho
-            if not header_written:
-                all_csv_texts.append(data)
-                header_written = True
-            else:
-                lines = data.strip().split('\n')
-                if len(lines) > 1: # Ignora o cabeçalho se houver e adiciona o resto
-                    all_csv_texts.append('\n'.join(lines[1:]))
-
-    if endpoint_info['is_json']:
-        if all_dfs:
-            final_df = pd.concat(all_dfs, ignore_index=True, join='outer')
-            final_df = format_money_columns(final_df)
-            return final_df
-        else:
-            logger.warning("Nenhum DataFrame foi gerado a partir dos dados JSON.")
-            return pd.DataFrame()
-    else: # Retorna texto CSV concatenado
-        if all_csv_texts:
-            return '\n'.join(all_csv_texts)
-        else:
-            logger.warning("Nenhum texto CSV foi coletado.")
-            return ""
+        if status == 'success':
+            results_list.append({'id': item_id, 'data': data, 'is_json': is_json})
+        elif status == 'error_retry':
+            failed_ids_list.append(item_id)
+            # Pausa extra para erros que indicam sobrecarga da API
+            logger.info(f"Pausa adicional de {REQUEST_ERROR_DELAY} segundos devido a erro.")
+            await asyncio.sleep(REQUEST_ERROR_DELAY)
+        
+        # Pausa padrão após cada requisição
+        logger.info(f"Pausa de {REQUEST_SUCCESS_DELAY} segundos antes da próxima requisição.")
+        await asyncio.sleep(REQUEST_SUCCESS_DELAY)
 
 async def main():
-    """
-    Função principal para parsear argumentos, coletar dados e salvar.
-    """
-    parser = argparse.ArgumentParser(description="Coleta dados do PNCP.")
+    """Função principal para orquestrar a coleta de dados."""
+    parser = argparse.ArgumentParser(description="Coleta dados do PNCP de forma sequencial e amigável.")
     parser.add_argument('--api', type=str, required=True, choices=API_ENDPOINTS.keys(), help="Tipo de API a ser consultada.")
     parser.add_argument('--output', type=str, required=True, help="Nome do arquivo de saída (ex: dados.csv).")
     args = parser.parse_args()
 
     ids_filepath = 'id_lista.txt'
     try:
-        ids_to_process = read_ids_from_file(ids_filepath)
-    except (FileNotFoundError, Exception):
+        initial_ids = read_ids_from_file(ids_filepath)
+    except FileNotFoundError:
         return
 
-    if not ids_to_process:
+    if not initial_ids:
         logger.warning("Nenhum ID válido para processar. Encerrando.")
         return
 
-    logger.info(f"Iniciando coleta de dados para a API: {args.api}")
-    
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    
-    data_result = await collect_data(args.api, ids_to_process, semaphore)
+    endpoint_info = API_ENDPOINTS[args.api]
+    all_results = []
+    failed_ids = []
 
-    output_filename = args.output
+    async with aiohttp.ClientSession() as session:
+        # --- Primeira Passagem ---
+        logger.info(f"--- INICIANDO PRIMEIRA PASSAGEM DE COLETA PARA {len(initial_ids)} IDs ---")
+        await run_collection_pass(session, initial_ids, endpoint_info, all_results, failed_ids)
+        logger.info(f"--- PRIMEIRA PASSAGEM CONCLUÍDA. {len(failed_ids)} IDs falharam e serão repetidos. ---")
 
-    if data_result is not None:
-        if isinstance(data_result, pd.DataFrame):
-            if not data_result.empty:
+        # --- Segunda Passagem (Repetição) ---
+        if failed_ids:
+            retried_ids = list(failed_ids) # Copia a lista para uma nova
+            failed_ids.clear() # Limpa a lista original de falhas
+            logger.info(f"--- INICIANDO SEGUNDA PASSAGEM PARA OS {len(retried_ids)} IDs QUE FALHARAM ---")
+            await run_collection_pass(session, retried_ids, endpoint_info, all_results, failed_ids)
+            logger.info("--- SEGUNDA PASSAGEM CONCLUÍDA. ---")
+            if failed_ids:
+                logger.warning(f"Os seguintes IDs falharam mesmo após a segunda tentativa: {failed_ids}")
+
+    # --- Processamento e Consolidação dos Resultados ---
+    if endpoint_info['is_json']:
+        all_dfs = []
+        for result in all_results:
+            if result['is_json'] and isinstance(result['data'], dict) and 'resultado' in result['data']:
                 try:
-                    data_result.to_csv(output_filename, index=False, encoding='utf-8-sig', sep=';')
-                    logger.info(f"Dados coletados salvos em '{output_filename}'.")
+                    df_response = pd.json_normalize(result['data']['resultado'])
+                    if not df_response.empty:
+                        df_response['idCompra_original'] = result['id']
+                        all_dfs.append(df_response)
                 except Exception as e:
-                    logger.error(f"Erro ao salvar DataFrame em '{output_filename}': {e}")
-            else:
-                logger.warning("Nenhum dado foi coletado para salvar.")
-        elif isinstance(data_result, str) and data_result.strip():
-            try:
-                with open(output_filename, 'w', encoding='utf-8-sig') as f:
-                    f.write(data_result)
-                logger.info(f"Dados CSV brutos salvos em '{output_filename}'.")
-            except Exception as e:
-                logger.error(f"Erro ao salvar texto CSV em '{output_filename}': {e}")
-    else:
-        logger.warning(f"Nenhum dado foi coletado ou gerado para salvar no arquivo '{output_filename}'.")
+                    logger.error(f"Erro ao normalizar dados para ID {result['id']}: {e}")
+        
+        if all_dfs:
+            final_df = pd.concat(all_dfs, ignore_index=True, join='outer')
+            final_df = format_money_columns(final_df)
+            final_df.to_csv(args.output, index=False, encoding='utf-8-sig', sep=';')
+            logger.info(f"Dados JSON coletados e salvos em '{args.output}'.")
+        else:
+            logger.warning("Nenhum dado JSON foi coletado com sucesso para salvar.")
+    else: # CSV
+        all_csv_texts = []
+        header_written = False
+        for result in all_results:
+            if not result['is_json'] and isinstance(result['data'], str):
+                if not header_written:
+                    all_csv_texts.append(result['data'].strip())
+                    header_written = True
+                else:
+                    lines = result['data'].strip().split('\n')
+                    if len(lines) > 1:
+                        all_csv_texts.append('\n'.join(lines[1:]))
+        
+        if all_csv_texts:
+            final_csv_text = '\n'.join(all_csv_texts)
+            with open(args.output, 'w', encoding='utf-8-sig') as f:
+                f.write(final_csv_text)
+            logger.info(f"Dados CSV coletados e salvos em '{args.output}'.")
+        else:
+            logger.warning("Nenhum dado CSV foi coletado com sucesso para salvar.")
 
-    logger.info("Coleta de dados concluída.")
+    logger.info("Processo de coleta de dados concluído.")
 
 if __name__ == '__main__':
     asyncio.run(main())
