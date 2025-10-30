@@ -8,211 +8,177 @@ import io
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# --- Mapeamento de Endpoints de API ---
+# Mapeamento de endpoints da API
 API_ENDPOINTS = {
     "CONTRATACAO": {
-        "url_base": "https://dadosabertos.compras.gov.br/modulo-contratacoes/1.1_consultarContratacoes_PNCP_14133_Id",
-        "param_name": "codigo",
-        "is_json": True,
-        "default_filename": "contratacoes.csv"
+        "url": "https://dadosabertos.compras.gov.br/modulo-contratacoes/1.1_consultarContratacoes_PNCP_14133_Id",
+        "id_param": "codigo",
+        "is_csv": False,
+        "accept_header": "application/json"
     },
     "ITENS": {
-        "url_base": "https://dadosabertos.compras.gov.br/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id",
-        "param_name": "codigo",
-        "is_json": True,
-        "default_filename": "itens_contratacoes.csv"
+        "url": "https://dadosabertos.compras.gov.br/modulo-contratacoes/2.1_consultarItensContratacoes_PNCP_14133_Id",
+        "id_param": "codigo",
+        "is_csv": False,
+        "accept_header": "application/json"
     },
     "RESULTADOS": {
-        "url_base": "https://dadosabertos.compras.gov.br/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id",
-        "param_name": "codigo",
-        "is_json": True,
-        "default_filename": "resultados_itens.csv"
+        "url": "https://dadosabertos.compras.gov.br/modulo-contratacoes/3.1_consultarResultadoItensContratacoes_PNCP_14133_Id",
+        "id_param": "codigo",
+        "is_csv": False,
+        "accept_header": "application/json"
     },
     "PRECOS_MATERIAL": {
-        "url_base": "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV",
-        "param_name": "codigoItemCatalogo",
-        "is_json": False,
-        "default_filename": "precos_material.csv"
+        "url": "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/1.1_consultarMaterial_CSV",
+        "id_param": "codigoItemCatalogo",
+        "is_csv": True,
+        "accept_header": "text/csv"
     },
     "PRECOS_SERVICO": {
-        "url_base": "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV",
-        "param_name": "codigoItemCatalogo",
-        "is_json": False,
-        "default_filename": "precos_servico.csv"
-    }
+        "url": "https://dadosabertos.compras.gov.br/modulo-pesquisa-preco/3.1_consultarServico_CSV",
+        "id_param": "codigoItemCatalogo",
+        "is_csv": True,
+        "accept_header": "text/csv"
+    },
 }
 
-async def fetch(session, url, current_id, api_type):
+async def fetch_data(session, api_config, item_id, semaphore):
     """
-    Realiza uma requisição HTTP GET assíncrona para a URL especificada.
-    Retorna o conteúdo da resposta se bem-sucedida, caso contrário, None.
+    Faz uma requisição assíncrona para a API e retorna os dados.
     """
-    try:
-        async with session.get(url, headers={'accept': '*/*'}) as response:
-            response.raise_for_status()  # Lança exceção para códigos de status HTTP 4xx/5xx
-            if api_type["is_json"]:
-                return await response.json()
-            else:
-                return await response.text()
-    except aiohttp.ClientError as e:
-        logging.error(f"Erro ao buscar {current_id} da API {api_type['url_base']}: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Erro inesperado ao buscar {current_id} da API {api_type['url_base']}: {e}")
-        return None
+    url_base = api_config["url"]
+    id_param = api_config["id_param"]
+    is_csv = api_config["is_csv"]
+    accept_header = api_config["accept_header"]
 
-async def bound_fetch(sem, session, url, current_id, api_type):
-    """
-    Limita a concorrência das requisições usando um semáforo.
-    """
-    async with sem:
-        return await fetch(session, url, current_id, api_type)
+    # Construir a URL com os parâmetros corretos
+    if is_csv:
+        # APIs de preço CSV usam 'pagina' e 'tamanhoPagina' e o id_param
+        # Aqui assumimos pagina=1 e tamanhoPagina=10, mas poderiam ser configuráveis.
+        # O id_param aqui é codigoItemCatalogo
+        url = f"{url_base}?pagina=1&tamanhoPagina=10&{id_param}={item_id}"
+    else:
+        # APIs de contratação usam 'tipo=idCompra' e o id_param
+        # O id_param aqui é 'codigo'
+        url = f"{url_base}?tipo=idCompra&{id_param}={item_id}"
+    
+    headers = {'accept': accept_header}
 
-async def collect_data(ids, api_info, max_concurrent_requests=3):
-    """
-    Coleta dados de múltiplas APIs de forma assíncrona.
-    """
-    all_results = []
-    # Usado para concatenar CSVs, mantendo o cabeçalho apenas do primeiro
-    csv_parts = []
-    first_csv_header = None
+    async with semaphore:
+        try:
+            async with session.get(url, headers=headers, timeout=30) as response:
+                response.raise_for_status()  # Levanta HTTPError para códigos de status 4xx/5xx
 
-    sem = asyncio.Semaphore(max_concurrent_requests)
+                if is_csv:
+                    return await response.text()  # Retorna texto puro para CSV
+                else:
+                    return await response.json() # Retorna JSON para as outras APIs
+        except aiohttp.ClientError as e:
+            logger.error(f"Erro ao buscar dados para ID {item_id} da API {api_config['url']}: {e}")
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout ao buscar dados para ID {item_id} da API {api_config['url']}")
+            return None
+
+async def main(api_name, output_filename):
+    """
+    Função principal que coordena a busca e o salvamento dos dados.
+    """
+    if api_name not in API_ENDPOINTS:
+        logger.error(f"Tipo de API '{api_name}' inválido. Opções válidas são: {', '.join(API_ENDPOINTS.keys())}")
+        return
+
+    api_config = API_ENDPOINTS[api_name]
+    logger.info(f"Iniciando coleta de dados para a API: {api_name}")
+
+    ids = read_ids_from_file("id_lista.txt")
+    if not ids:
+        logger.error("Nenhum ID válido encontrado em 'id_lista.txt'. Encerrando.")
+        return
+
+    all_data = []
+    # Limita o número de requisições concorrentes
+    semaphore = asyncio.Semaphore(5) 
+
     async with aiohttp.ClientSession() as session:
-        tasks = []
-        for current_id in ids:
-            url = f"{api_info['url_base']}?tipo=idCompra&{api_info['param_name']}={current_id}"
-            if not api_info["is_json"]: # Para APIs de preço, adicionar paginação default
-                if api_info["param_name"] == "codigoItemCatalogo":
-                    # Ajusta a URL para incluir os parâmetros de paginação para as APIs de preço
-                    url = f"{api_info['url_base']}?pagina=1&tamanhoPagina=10&{api_info['param_name']}={current_id}"
-                else: # Mantém o tipo=idCompra para outros casos se houver
-                    url = f"{api_info['url_base']}?tipo=idCompra&{api_info['param_name']}={current_id}"
+        tasks = [fetch_data(session, api_config, item_id, semaphore) for item_id in ids]
+        results = await asyncio.gather(*tasks)
 
-            tasks.append(bound_fetch(sem, session, url, current_id, api_info))
-
-        logging.info(f"Iniciando a coleta de dados para {len(ids)} IDs...")
-        responses = await asyncio.gather(*tasks)
-        logging.info("Coleta de dados concluída.")
-
-        for i, data in enumerate(responses):
-            current_id = ids[i]
-            if data:
-                if api_info["is_json"]:
-                    if isinstance(data, list):
-                        all_results.extend(data)
+        if api_config["is_csv"]:
+            # Processamento para APIs que retornam CSV diretamente
+            header_written = False
+            with open(output_filename, 'w', encoding='utf-8') as f:
+                for idx, result in enumerate(results):
+                    if result:
+                        lines = result.strip().split('\n')
+                        if not header_written:
+                            f.write(lines[0] + '\n') # Escreve o cabeçalho apenas uma vez
+                            header_written = True
+                        if len(lines) > 1:
+                            f.write('\n'.join(lines[1:]) + '\n') # Escreve as linhas de dados (sem o cabeçalho)
+                        logger.info(f"Dados CSV para ID {ids[idx]} processados com sucesso.")
                     else:
-                        all_results.append(data)
-                else: # Processa como CSV
-                    # Divide o CSV em linhas
-                    lines = data.strip().split('\n')
-                    if not lines:
-                        continue
-
-                    # Se for o primeiro CSV, armazena o cabeçalho
-                    if first_csv_header is None:
-                        first_csv_header = lines[0]
-                        csv_parts.append(first_csv_header)
-                        # Adiciona o restante das linhas (sem o cabeçalho)
-                        csv_parts.extend(lines[1:])
+                        logger.warning(f"Nenhum dado CSV retornado para ID {ids[idx]}.")
+            logger.info(f"Todos os dados CSV compilados em '{output_filename}'.")
+        else:
+            # Processamento para APIs que retornam JSON
+            for idx, result in enumerate(results):
+                if result:
+                    # A API pode retornar uma lista de objetos JSON ou um único objeto
+                    if isinstance(result, list):
+                        all_data.extend(result)
                     else:
-                        # Para os CSVs subsequentes, adiciona apenas os dados (ignora o cabeçalho)
-                        if len(lines) > 1: # Garante que há dados além do cabeçalho
-                            csv_parts.extend(lines[1:])
+                        all_data.append(result)
+                    logger.info(f"Dados JSON para ID {ids[idx]} processados com sucesso.")
+                else:
+                    logger.warning(f"Nenhum dado JSON retornado para ID {ids[idx]}.")
+            
+            if all_data:
+                df_final = pd.DataFrame(all_data)
+                df_final.to_csv(output_filename, index=False, encoding='utf-8', sep=';')
+                logger.info(f"Todos os dados JSON compilados e salvos em '{output_filename}'.")
             else:
-                logging.warning(f"Nenhum dado retornado para o ID: {current_id}")
+                logger.warning("Nenhum dado JSON foi coletado. Nenhum arquivo CSV será gerado.")
 
-    if api_info["is_json"]:
-        return pd.DataFrame(all_results) if all_results else pd.DataFrame()
-    else: # Retorna o conteúdo CSV concatenado como uma única string
-        return '\n'.join(csv_parts) if csv_parts else ""
 
-def read_ids_from_file(filepath="id_lista.txt"):
+def read_ids_from_file(filename):
     """
-    Lê IDs de um arquivo de texto, um por linha.
-    Retorna uma lista de IDs.
+    Lê uma lista de IDs de um arquivo de texto.
+    Cada ID deve estar em uma nova linha.
     """
     ids = []
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filename, 'r', encoding='utf-8') as f:
             for line in f:
-                stripped_line = line.strip()
-                if stripped_line:  # Ignora linhas vazias
-                    ids.append(stripped_line)
-        logging.info(f"Lidos {len(ids)} IDs do arquivo '{filepath}'.")
+                line = line.strip()
+                if line:  # Ignora linhas vazias
+                    ids.append(line)
+        logger.info(f"{len(ids)} IDs lidos de '{filename}'.")
     except FileNotFoundError:
-        logging.error(f"Erro: O arquivo '{filepath}' não foi encontrado. Certifique-se de que ele existe e está na mesma pasta.")
-        exit(1)
+        logger.error(f"Erro: O arquivo '{filename}' não foi encontrado no diretório atual.")
     except Exception as e:
-        logging.error(f"Erro ao ler o arquivo '{filepath}': {e}")
-        exit(1)
+        logger.error(f"Erro ao ler IDs do arquivo '{filename}': {e}")
     return ids
 
-def main():
-    parser = argparse.ArgumentParser(description="Coleta dados do PNCP (Painel Nacional de Contratações Públicas) de forma assíncrona.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Coleta dados da API Compras.gov.br PNCP.")
     parser.add_argument(
         "--api",
         type=str,
         required=True,
         choices=API_ENDPOINTS.keys(),
-        help="Selecione o tipo de API a ser consultada: " + ", ".join(API_ENDPOINTS.keys())
+        help="Tipo de API a ser consultada."
     )
     parser.add_argument(
         "--output",
         type=str,
-        default=None,
-        help="Nome do arquivo CSV de saída. Ex: dados.csv"
-    )
-    parser.add_argument(
-        "--ids_file",
-        type=str,
-        default="id_lista.txt",
-        help="Caminho para o arquivo contendo a lista de IDs, um por linha."
+        required=True,
+        help="Nome do arquivo de saída (ex: dados.csv)."
     )
 
     args = parser.parse_args()
 
-    # Valida a API selecionada
-    api_info = API_ENDPOINTS.get(args.api)
-    if not api_info:
-        logging.error(f"API '{args.api}' inválida. Escolha entre: {', '.join(API_ENDPOINTS.keys())}")
-        return
-
-    # Define o nome do arquivo de saída
-    output_filename = args.output if args.output else api_info["default_filename"]
-    if not output_filename.endswith('.csv'):
-        output_filename += '.csv'
-
-    logging.info(f"API selecionada: {args.api}")
-    logging.info(f"Arquivo de IDs: {args.ids_file}")
-    logging.info(f"Arquivo de saída: {output_filename}")
-
-    # Lê os IDs do arquivo
-    ids_to_fetch = read_ids_from_file(args.ids_file)
-    if not ids_to_fetch:
-        logging.warning("Nenhum ID encontrado no arquivo. Encerrando.")
-        return
-
-    # Executa a coleta de dados assíncrona
-    try:
-        if api_info["is_json"]:
-            df = asyncio.run(collect_data(ids_to_fetch, api_info))
-            if not df.empty:
-                df.to_csv(output_filename, index=False, encoding='utf-8')
-                logging.info(f"Dados compilados salvos em '{output_filename}' (formato JSON -> CSV).")
-            else:
-                logging.warning("Nenhum dado foi coletado para salvar.")
-        else: # É uma API que retorna CSV diretamente
-            csv_content = asyncio.run(collect_data(ids_to_fetch, api_info))
-            if csv_content:
-                with open(output_filename, 'w', encoding='utf-8') as f:
-                    f.write(csv_content)
-                logging.info(f"Dados compilados salvos em '{output_filename}' (formato CSV direto).")
-            else:
-                logging.warning("Nenhum dado CSV foi coletado para salvar.")
-    except Exception as e:
-        logging.critical(f"Ocorreu um erro fatal durante a execução: {e}")
-
-if __name__ == '__main__':
-    main()
+    asyncio.run(main(args.api, args.output))
