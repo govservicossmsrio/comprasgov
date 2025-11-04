@@ -9,7 +9,7 @@ on:
   # Aciona automaticamente em um agendamento (schedule)
   schedule:
     # Roda a cada 6 horas (às 00:00, 06:00, 12:00, 18:00 UTC)
-    - cron: '0 */6 * * *'
+    #[DESATIVADO] - cron: '0 */6 * * *'
 
 jobs:
   # Nome do Job
@@ -52,4 +52,5 @@ jobs:
           # Informações do autor do commit (para identificar que foi o bot)
           commit_user_name: "GitHub Actions Bot"
           commit_user_email: "actions@github.com"
+
           commit_author: "GitHub Actions Bot <actions@github.com>"
