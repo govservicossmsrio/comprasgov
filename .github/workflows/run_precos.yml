@@ -9,7 +9,7 @@ on:
   # Aciona automaticamente em um agendamento (schedule)
   schedule:
     # Roda uma vez por dia, à 1 da manhã (UTC)
-    - cron: '0 1 * * *'
+    #[DESATIVADO] - cron: '0 1 * * *'
 
 jobs:
   # Nome do Job
